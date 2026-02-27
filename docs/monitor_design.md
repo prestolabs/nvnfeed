@@ -169,7 +169,7 @@ Label values: `process` ∈ {`hl-node`, `hl-visor`}
 | `disk_warning` | Disk usage >80% | 600s | warning | plain |
 | `disk_critical` | Disk usage >90% | 300s | critical | @here |
 | `error_burst` | >10 error log lines in last 5 minutes | 300s | warning | plain |
-| `visor_lag` | Visor height >1000 blocks behind fast chain | 300s | warning | plain |
+| `visor_lag` | Visor height >10000 blocks (~15min) behind fast chain | 300s | warning | plain |
 | `clock_skew` | Visor clock skew >2 seconds | 300s | warning | plain |
 
 ## Architecture

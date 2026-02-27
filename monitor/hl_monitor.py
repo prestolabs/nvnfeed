@@ -572,10 +572,12 @@ class AlertManager:
         if total_errors > 10 and self._can_fire("error_burst", 300):
             self._fire("error_burst", "warning", f"{total_errors} errors in last 5min")
 
-        # visor_lag: >1000 blocks behind fast chain
+        # visor_lag: >10000 blocks (~15min) behind fast chain
+        # Note: visor writer buffers ~60s, so normal lag can be up to ~660 blocks.
+        # Use 10000 threshold to avoid false positives from buffered writes.
         if state.fast_height > 0 and state.visor_h > 0:
             lag = state.fast_height - state.visor_h
-            if lag > 1000 and self._can_fire("visor_lag", 300):
+            if lag > 10000 and self._can_fire("visor_lag", 300):
                 self._fire("visor_lag", "warning", f"Visor lagging {lag} blocks behind fast chain")
 
         # clock_skew: >2s
