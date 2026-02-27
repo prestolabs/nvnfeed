@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+import sys
+import os
+
+CONDA_PYTHON = '/home/ubuntu/miniconda3/envs/coin2_prod_env_310/bin/python'
+
+
+def get_env():
+    env = dict(os.environ)
+    env['TZ'] = 'UTC'
+    REPO_ROOT = os.path.dirname(os.path.realpath(__file__))
+    EXTRA_PYTHON_PATHS = [
+        REPO_ROOT,
+        '/home/ubuntu/projects/coin/external/xunkemgmt/xunkemgmt_client/python',
+    ]
+    PYTHONPATH = os.environ.get('PYTHONPATH', '')
+    lst = EXTRA_PYTHON_PATHS + ([PYTHONPATH] if PYTHONPATH else [])
+    env['PYTHONPATH'] = ':'.join(lst)
+    return env
+
+
+def main(argv):
+    if len(argv) < 2:
+        os.execvpe(CONDA_PYTHON, [CONDA_PYTHON], get_env())
+    elif argv[1] in ['-c', '-m']:
+        os.execvpe(CONDA_PYTHON, [CONDA_PYTHON] + argv[1:], get_env())
+    else:
+        os.execvpe(CONDA_PYTHON, [CONDA_PYTHON] + argv[1:], get_env())
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
