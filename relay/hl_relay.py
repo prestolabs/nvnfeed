@@ -25,11 +25,13 @@ Wire protocol (line-delimited, same over TCP and WebSocket):
 Subscription is REQUIRED before data is sent. Clients have 10 seconds to subscribe.
 
 TCP clients send a JSON line:
-  {"coins":["BTC","ETH"],"compress":true}
+  {"coins":["BTC","ETH"],"compress":true,"channels":["book","trade"]}
   {} or {"coins":[]} → all coins, no filtering
+  "channels": ["book"] → only D lines, ["trade"] → only F lines,
+              ["book","trade"] → both, omitted → both (backward compat)
 
 WebSocket clients send a text frame after handshake:
-  {"coins":["BTC","ETH"]}
+  {"coins":["BTC","ETH"],"channels":["book"]}
   (connect via: wsdump ws://host:ws-port/ws)
 """
 
@@ -351,19 +353,38 @@ def filter_fills_line(raw: str, coins: set[str]) -> str | None:
     batch["events"] = filtered
     return json.dumps(batch, separators=(",", ":"))
 
+# ── Channel subscription ──────────────────────────────────────────────────────
+
+_CHANNEL_MAP = {"book": "D", "trade": "F"}
+
+def _parse_channels(sub: dict) -> set[str]:
+    """Parse the 'channels' field from a subscription dict.
+    Returns a set of internal channel codes ('D' and/or 'F').
+    Omitted or invalid → both channels (backward compat)."""
+    raw = sub.get("channels")
+    if not raw or not isinstance(raw, list):
+        return {"D", "F"}
+    parsed = set()
+    for ch in raw:
+        if ch in _CHANNEL_MAP:
+            parsed.add(_CHANNEL_MAP[ch])
+    return parsed if parsed else {"D", "F"}
+
 # ── Client state ─────────────────────────────────────────────────────────────
 
 class ClientState:
-    __slots__ = ("addr", "queue", "coins", "compress", "compressor",
+    __slots__ = ("addr", "queue", "coins", "channels", "compress", "compressor",
                  "consecutive_drops", "writer", "active", "is_ws", "ws_deflate")
 
     def __init__(self, addr: str, writer: asyncio.StreamWriter,
                  coins: set[str] | None = None, compress: bool = False,
-                 is_ws: bool = False, ws_deflate: WsDeflate | None = None):
+                 is_ws: bool = False, ws_deflate: WsDeflate | None = None,
+                 channels: set[str] | None = None):
         self.addr = addr
         self.writer = writer
         self.queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=2000)
         self.coins = coins  # None = all coins (unfiltered)
+        self.channels = channels if channels is not None else {"D", "F"}
         self.compress = compress
         self.compressor = None
         if compress:
@@ -404,6 +425,8 @@ class Dispatcher:
         to_remove = []
         for client in self.clients:
             if not client.active:
+                continue
+            if channel not in client.channels:
                 continue
 
             msg = None
@@ -549,14 +572,17 @@ async def handle_client(reader: asyncio.StreamReader,
         writer.close()
         return
 
-    client = ClientState(addr_str, writer, coins, compress)
+    channels = _parse_channels(sub)
+    client = ClientState(addr_str, writer, coins, compress, channels=channels)
     dispatcher.clients.add(client)
 
     # Send subscription confirmation
+    _INV_CHANNEL_MAP = {v: k for k, v in _CHANNEL_MAP.items()}
     status = {
         "status": "subscribed",
         "coins": sorted(coins) if coins else "all",
         "compress": compress,
+        "channels": sorted(_INV_CHANNEL_MAP[c] for c in channels),
     }
     try:
         await _send_ctrl(writer, status, client)
@@ -564,8 +590,8 @@ async def handle_client(reader: asyncio.StreamReader,
         dispatcher.clients.discard(client)
         return
 
-    log.info("TCP client %s subscribed: coins=%s compress=%s",
-             addr_str, coins or "all", compress)
+    log.info("TCP client %s subscribed: coins=%s compress=%s channels=%s",
+             addr_str, coins or "all", compress, channels)
 
     # Run the writer task; it exits when client disconnects or is kicked
     try:
@@ -671,15 +697,18 @@ async def handle_ws_client(reader: asyncio.StreamReader,
         writer.close()
         return
 
+    channels = _parse_channels(sub)
     client = ClientState(addr_str, writer, coins, compress=False,
-                         is_ws=True, ws_deflate=ws_deflate)
+                         is_ws=True, ws_deflate=ws_deflate, channels=channels)
     dispatcher.clients.add(client)
 
     # Send subscription confirmation as WS text frame
+    _INV_CHANNEL_MAP = {v: k for k, v in _CHANNEL_MAP.items()}
     status = {
         "status": "subscribed",
         "coins": sorted(coins) if coins else "all",
         "compress": deflate_str,
+        "channels": sorted(_INV_CHANNEL_MAP[c] for c in channels),
     }
     try:
         await _send_ctrl(writer, status, client)
@@ -687,8 +716,8 @@ async def handle_ws_client(reader: asyncio.StreamReader,
         dispatcher.clients.discard(client)
         return
 
-    log.info("WS client %s subscribed: coins=%s deflate=%s",
-             addr_str, coins or "all", deflate_str)
+    log.info("WS client %s subscribed: coins=%s deflate=%s channels=%s",
+             addr_str, coins or "all", deflate_str, channels)
 
     # Run reader (ping/pong/close) and writer concurrently
     reader_task = asyncio.create_task(_ws_reader_loop(reader, writer, client))
