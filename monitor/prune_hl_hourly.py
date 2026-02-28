@@ -145,7 +145,7 @@ def main():
     parser.add_argument(
         "--max-age",
         type=int,
-        default=4,
+        default=2,
         help="Hours of data to retain (default: 8)",
     )
     parser.add_argument(
