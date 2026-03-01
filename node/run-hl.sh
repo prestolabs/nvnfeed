@@ -6,7 +6,6 @@
 /home/ubuntu/hl-visor run-non-validator  \
        	--write-trades \
 	--write-fills  \
-	--write-order-statuses \
 	--write-raw-book-diffs \
 	--batch-by-block \
 	--disable-output-file-buffering
