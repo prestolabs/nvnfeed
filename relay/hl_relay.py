@@ -327,6 +327,10 @@ async def ws_handshake(reader: asyncio.StreamReader,
 def filter_diffs_line(raw: str, coins: set[str]) -> str | None:
     """Filter a book-diffs JSON line to only include events for given coins.
     Returns filtered JSON string, or None if no matching events."""
+    # NOTE: current production clients subscribe to batch-by-block (B) format.
+    # This filter therefore expects a batch object with an "events" array.
+    # If line/single-event (L) subscriptions are introduced, this logic must
+    # be extended to handle that payload shape as well.
     # Quick reject: check if any coin name appears in the raw string
     if not any(f'"{c}"' in raw for c in coins):
         return None
@@ -342,6 +346,10 @@ def filter_diffs_line(raw: str, coins: set[str]) -> str | None:
 def filter_fills_line(raw: str, coins: set[str]) -> str | None:
     """Filter a fills JSON line to only include fill pairs for given coins.
     Fill events come in pairs (buyer + seller); keep pairs together."""
+    # NOTE: current production clients subscribe to batch-by-block (B) format.
+    # This filter therefore expects a batch object with an "events" array.
+    # If line/single-event (L) subscriptions are introduced, this logic must
+    # be extended to handle that payload shape as well.
     if not any(f'"{c}"' in raw for c in coins):
         return None
     batch = json.loads(raw)
