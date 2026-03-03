@@ -58,6 +58,8 @@ libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 libc.inotify_init.restype = ctypes.c_int
 libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
 libc.inotify_add_watch.restype = ctypes.c_int
+libc.inotify_rm_watch.argtypes = [ctypes.c_int, ctypes.c_int]
+libc.inotify_rm_watch.restype = ctypes.c_int
 
 IN_MODIFY = 0x00000002
 IN_CREATE = 0x00000100
@@ -69,11 +71,19 @@ class FileTailer:
     """Tails a file, reopening on hour rotation.
     Buffers incomplete lines to avoid dispatching partial JSON."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, from_start: bool = False):
         self.path = path
         self.file = None
         self._buf = ""  # incomplete trailing line from previous read
-        self._open_at_end()
+        if from_start:
+            self._open_at_start()
+        else:
+            self._open_at_end()
+
+    def _open_at_start(self):
+        if os.path.exists(self.path):
+            self.file = open(self.path, "r")
+            # Position 0: read all existing content then continue tailing
 
     def _open_at_end(self):
         if os.path.exists(self.path):
@@ -638,11 +648,13 @@ async def handle_ws_client(reader: asyncio.StreamReader,
         request_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
     except asyncio.TimeoutError:
         writer.close()
+        await writer.wait_closed()
         return
     if not request_line.startswith(b"GET "):
         writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
         await writer.drain()
         writer.close()
+        await writer.wait_closed()
         return
 
     # Complete WebSocket handshake (reads remaining headers, negotiates deflate)
@@ -650,9 +662,11 @@ async def handle_ws_client(reader: asyncio.StreamReader,
         ok, ws_deflate = await ws_handshake(reader, writer)
         if not ok:
             writer.close()
+            await writer.wait_closed()
             return
     except (asyncio.TimeoutError, ConnectionError, OSError):
         writer.close()
+        await writer.wait_closed()
         return
 
     deflate_str = "on" if ws_deflate else "off"
@@ -671,6 +685,7 @@ async def handle_ws_client(reader: asyncio.StreamReader,
             writer.write(ws_encode_frame(b"", WS_OP_CLOSE))
             await writer.drain()
             writer.close()
+            await writer.wait_closed()
             return
         else:
             raise ValueError("expected text frame with subscription")
@@ -682,6 +697,7 @@ async def handle_ws_client(reader: asyncio.StreamReader,
         writer.write(ws_encode_frame(b"", WS_OP_CLOSE))
         await writer.drain()
         writer.close()
+        await writer.wait_closed()
         return
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError,
             asyncio.IncompleteReadError) as e:
@@ -695,6 +711,7 @@ async def handle_ws_client(reader: asyncio.StreamReader,
         except (ConnectionError, OSError):
             pass
         writer.close()
+        await writer.wait_closed()
         return
 
     channels = _parse_channels(sub)
@@ -757,6 +774,11 @@ class InotifyWatcher:
                 return wd
         return -1
 
+    def _remove_watch(self, wd: int):
+        """Remove an inotify watch and clean up watch_map."""
+        libc.inotify_rm_watch(self.ifd, wd)
+        self.watch_map.pop(wd, None)
+
     def setup_watches(self):
         """Set up initial watches for current date dirs, hour files, and hourly base dirs."""
         for base, src_type in [(self.book_base, "book"), (self.fills_base, "fills")]:
@@ -809,11 +831,16 @@ class InotifyWatcher:
                 # New hour file created
                 base_type = src_type.replace("_date_dir", "")
                 new_hour_path = os.path.join(path, name)
+                # Remove old hour-file watch (if any) before adding the new one
+                old_wd = next((wd for wd, (st, _) in self.watch_map.items()
+                               if st == base_type), None)
+                if old_wd is not None:
+                    self._remove_watch(old_wd)
                 self._add_watch(new_hour_path, base_type, IN_MODIFY)
                 # Close old tailer, open new one from the beginning
                 if base_type in self.tailers:
                     self.tailers[base_type].close()
-                self.tailers[base_type] = FileTailer(new_hour_path)
+                self.tailers[base_type] = FileTailer(new_hour_path, from_start=True)
                 log.info("New hour file for %s: %s", base_type, new_hour_path)
 
             elif src_type in ("book", "fills") and (mask & IN_MODIFY):
@@ -872,13 +899,17 @@ class InotifyWatcher:
             hour_path = get_current_hour_path(base)
             if src_type in self.tailers and self.tailers[src_type].path != hour_path:
                 if os.path.exists(hour_path):
+                    old_wd = next((wd for wd, (st, _) in self.watch_map.items()
+                                   if st == src_type), None)
+                    if old_wd is not None:
+                        self._remove_watch(old_wd)
                     self._add_watch(hour_path, src_type, IN_MODIFY)
                     self.tailers[src_type].close()
-                    self.tailers[src_type] = FileTailer(hour_path)
+                    self.tailers[src_type] = FileTailer(hour_path, from_start=True)
                     log.info("Rotation: new hour file for %s: %s", src_type, hour_path)
             elif src_type not in self.tailers and os.path.exists(hour_path):
                 self._add_watch(hour_path, src_type, IN_MODIFY)
-                self.tailers[src_type] = FileTailer(hour_path)
+                self.tailers[src_type] = FileTailer(hour_path, from_start=True)
                 log.info("First hour file for %s: %s", src_type, hour_path)
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -929,6 +960,7 @@ async def async_main(args):
                 t.cancel()
             if ws_server:
                 ws_server.close()
+                await ws_server.wait_closed()
 
 
 def main():
