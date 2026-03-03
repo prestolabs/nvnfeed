@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Prune Hyperliquid non-validator node hourly data older than a configurable age.
+Prune Hyperliquid non-validator node data older than a configurable age.
 
-Layout: /home/ubuntu/hl/data/<source>/hourly/<YYYYMMDD>/<H>
+Hourly layout: /home/ubuntu/hl/data/<source>/hourly/<YYYYMMDD>/<H>
   - <YYYYMMDD> is a date directory
   - <H> is a file named by hour (0-23)
 
+replica_cmds layout: /home/ubuntu/hl/data/replica_cmds/<session>/<YYYYMMDD>/<block>
+  - <session> is an ISO timestamp directory (e.g. 2026-03-02T16:00:07Z)
+  - <YYYYMMDD> is a date directory
+  - <block> is an NDJSON file named by block number
+
 Usage:
-  python3 prune_hourly.py                  # dry-run, 8h retention
+  python3 prune_hourly.py                  # dry-run, 2h retention
   python3 prune_hourly.py --execute        # actually delete
   python3 prune_hourly.py --max-age 4      # keep only last 4 hours
 
@@ -21,6 +26,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 DATA_ROOT = "/home/ubuntu/hl/data"
@@ -41,7 +47,6 @@ HOURLY_SOURCES = [
     "periodic_abci_state_statuses",
     "periodic_abci_states",
     "rate_limited_ips",
-    "replica_cmds",
     "tcp_lz4_stats",
     "tcp_traffic",
     "tokio_spawn_forever_metrics",
@@ -138,6 +143,86 @@ def prune(max_age_hours: int, execute: bool) -> dict:
     return stats
 
 
+def prune_replica_cmds(max_age_hours: int, execute: bool) -> dict:
+    """Prune replica_cmds data older than max_age_hours.
+
+    Layout: replica_cmds/<session>/<YYYYMMDD>/<block_number>
+    Uses file mtime for age since block numbers don't encode time.
+
+    Returns a dict of stats: {deleted_files, deleted_dirs, freed_bytes, errors}.
+    """
+    cutoff_ts = time.time() - max_age_hours * 3600
+    stats = {"deleted_files": 0, "deleted_dirs": 0, "freed_bytes": 0, "errors": 0}
+    replica_dir = os.path.join(DATA_ROOT, "replica_cmds")
+    if not os.path.isdir(replica_dir):
+        return stats
+
+    for session_name in sorted(os.listdir(replica_dir)):
+        session_path = os.path.join(replica_dir, session_name)
+        if not os.path.isdir(session_path):
+            continue
+
+        for date_name in sorted(os.listdir(session_path)):
+            date_path = os.path.join(session_path, date_name)
+            if not os.path.isdir(date_path):
+                continue
+
+            for block_name in sorted(os.listdir(date_path)):
+                block_path = os.path.join(date_path, block_name)
+                try:
+                    mtime = os.path.getmtime(block_path)
+                except OSError:
+                    continue
+                if mtime >= cutoff_ts:
+                    continue
+
+                try:
+                    size = os.path.getsize(block_path)
+                    if execute:
+                        os.remove(block_path)
+                    logging.info(
+                        "%s %s (%.1f MB)",
+                        "DELETED" if execute else "WOULD DELETE",
+                        block_path,
+                        size / 1e6,
+                    )
+                    stats["deleted_files"] += 1
+                    stats["freed_bytes"] += size
+                except OSError as e:
+                    logging.error("Failed to remove %s: %s", block_path, e)
+                    stats["errors"] += 1
+
+            # Remove empty date directory
+            try:
+                if os.path.isdir(date_path) and not os.listdir(date_path):
+                    if execute:
+                        os.rmdir(date_path)
+                    logging.info(
+                        "%s empty dir %s",
+                        "REMOVED" if execute else "WOULD REMOVE",
+                        date_path,
+                    )
+                    stats["deleted_dirs"] += 1
+            except OSError as e:
+                logging.error("Failed to remove empty dir %s: %s", date_path, e)
+
+        # Remove empty session directory
+        try:
+            if os.path.isdir(session_path) and not os.listdir(session_path):
+                if execute:
+                    os.rmdir(session_path)
+                logging.info(
+                    "%s empty dir %s",
+                    "REMOVED" if execute else "WOULD REMOVE",
+                    session_path,
+                )
+                stats["deleted_dirs"] += 1
+        except OSError as e:
+            logging.error("Failed to remove empty dir %s: %s", session_path, e)
+
+    return stats
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Prune Hyperliquid node hourly data older than N hours"
@@ -165,6 +250,10 @@ def main():
     logging.info("Prune start: mode=%s, max_age=%dh", mode, args.max_age)
 
     stats = prune(args.max_age, args.execute)
+    # Multiple of max_age to be safer for prune_replica_cmds because its update rule is not that clear
+    rc_stats = prune_replica_cmds(args.max_age * 2, args.execute)
+    for key in stats:
+        stats[key] += rc_stats[key]
 
     total_mb = stats["freed_bytes"] / 1e6
     logging.info(
