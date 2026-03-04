@@ -161,121 +161,223 @@ static std::string get_current_hour_path(const std::string& base_dir) {
 }
 
 // ============================================================================
-// Coin filtering with RapidJSON
+// Coin filtering — raw string splice (no DOM parse, no re-serialize)
 // ============================================================================
 
-// Filter a book-diffs batch JSON to only include events for given coins.
-// Returns empty string if no matching events.
-static std::string filter_diffs_line(const std::string& raw,
-                                     const std::unordered_set<std::string>& coins) {
-    // Fast string pre-check: scan for any quoted coin name
-    bool found_any = false;
-    for (auto& c : coins) {
-        // Build quoted version on stack for small coins
-        char quoted[128];
-        if (c.size() + 2 < sizeof(quoted)) {
-            quoted[0] = '"';
-            memcpy(quoted + 1, c.data(), c.size());
-            quoted[c.size() + 1] = '"';
-            quoted[c.size() + 2] = '\0';
-            if (raw.find(quoted) != std::string::npos) {
-                found_any = true;
-                break;
+// Scan forward from pos, skipping one JSON value (object, array, string,
+// number, bool, or null). Assumes compact JSON. Returns position after value.
+static size_t skip_json_value(const char* data, size_t len, size_t pos) {
+    if (pos >= len) return len;
+    char ch = data[pos];
+    if (ch == '{' || ch == '[') {
+        char close = (ch == '{') ? '}' : ']';
+        int depth = 1;
+        ++pos;
+        bool in_str = false;
+        while (pos < len && depth > 0) {
+            char c = data[pos];
+            if (in_str) {
+                if (c == '\\') { pos += 2; continue; }
+                if (c == '"') in_str = false;
+            } else {
+                if (c == '"') in_str = true;
+                else if (c == ch) ++depth;
+                else if (c == close) --depth;
             }
+            ++pos;
         }
+        return pos;
     }
-    if (!found_any) return {};
-
-    rapidjson::Document doc;
-    doc.Parse(raw.c_str(), raw.size());
-    if (doc.HasParseError() || !doc.IsObject()) return {};
-
-    auto it = doc.FindMember("events");
-    if (it == doc.MemberEnd() || !it->value.IsArray()) return {};
-
-    auto& events = it->value;
-    // Filter in place: move matching events to the front
-    rapidjson::SizeType write_idx = 0;
-    for (rapidjson::SizeType i = 0; i < events.Size(); ++i) {
-        auto& ev = events[i];
-        if (!ev.IsObject()) continue;
-        auto coin_it = ev.FindMember("coin");
-        if (coin_it == ev.MemberEnd() || !coin_it->value.IsString()) continue;
-        std::string coin_str(coin_it->value.GetString(), coin_it->value.GetStringLength());
-        if (coins.count(coin_str)) {
-            if (write_idx != i)
-                events[write_idx] = std::move(events[i]);
-            ++write_idx;
+    if (ch == '"') {
+        ++pos;
+        while (pos < len) {
+            if (data[pos] == '\\') { pos += 2; continue; }
+            if (data[pos] == '"') return pos + 1;
+            ++pos;
         }
+        return pos;
     }
-    if (write_idx == 0) return {};
-
-    // Resize the array by popping from back
-    while (events.Size() > write_idx)
-        events.PopBack();
-
-    rapidjson::StringBuffer sb;
-    rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
-    doc.Accept(writer);
-    return std::string(sb.GetString(), sb.GetSize());
+    // number, bool, null — scan until delimiter
+    while (pos < len && data[pos] != ',' && data[pos] != '}' && data[pos] != ']')
+        ++pos;
+    return pos;
 }
 
-// Filter a fills batch JSON to only include fill pairs for given coins.
-// Fill events come in pairs (buyer + seller); keep pairs together.
-static std::string filter_fills_line(const std::string& raw,
+// Check if any coin pattern matches within [start, end) of data
+static bool coin_matches(const char* data, size_t start, size_t end,
+                          const std::vector<std::pair<std::string, size_t>>& patterns) {
+    std::string_view view(data + start, end - start);
+    for (auto& [pat, pat_len] : patterns) {
+        if (view.find(std::string_view(pat.data(), pat_len)) != std::string_view::npos)
+            return true;
+    }
+    return false;
+}
+
+// Filter a book-diffs batch JSON to only include events for given coins.
+// Uses raw string splicing — no DOM parse, no re-serialize.
+static std::string filter_diffs_line(const std::string& raw,
                                      const std::unordered_set<std::string>& coins) {
+    const char* data = raw.data();
+    const size_t len = raw.size();
+
     // Fast string pre-check
     bool found_any = false;
     for (auto& c : coins) {
         char quoted[128];
-        if (c.size() + 2 < sizeof(quoted)) {
-            quoted[0] = '"';
-            memcpy(quoted + 1, c.data(), c.size());
-            quoted[c.size() + 1] = '"';
-            quoted[c.size() + 2] = '\0';
-            if (raw.find(quoted) != std::string::npos) {
-                found_any = true;
-                break;
-            }
+        quoted[0] = '"';
+        memcpy(quoted + 1, c.data(), c.size());
+        quoted[c.size() + 1] = '"';
+        quoted[c.size() + 2] = '\0';
+        if (raw.find(quoted) != std::string::npos) {
+            found_any = true;
+            break;
         }
     }
     if (!found_any) return {};
 
-    rapidjson::Document doc;
-    doc.Parse(raw.c_str(), raw.size());
-    if (doc.HasParseError() || !doc.IsObject()) return {};
+    // Find "events" key and its array value, handling optional whitespace
+    const char* ekey = "\"events\"";
+    const char* found = strstr(data, ekey);
+    if (!found) return {};
+    size_t pos_after_key = (found - data) + strlen(ekey);
+    // Skip optional whitespace and colon
+    while (pos_after_key < len && (data[pos_after_key] == ' ' ||
+           data[pos_after_key] == ':' || data[pos_after_key] == '\t')) ++pos_after_key;
+    if (pos_after_key >= len || data[pos_after_key] != '[') return {};
+    size_t arr_start = pos_after_key; // points at '['
 
-    auto it = doc.FindMember("events");
-    if (it == doc.MemberEnd() || !it->value.IsArray()) return {};
+    // Build coin patterns (both compact and spaced forms)
+    std::vector<std::pair<std::string, size_t>> patterns;
+    patterns.reserve(coins.size() * 2);
+    for (auto& c : coins) {
+        std::string p1 = "\"coin\":\"" + c + "\"";
+        std::string p2 = "\"coin\": \"" + c + "\"";
+        patterns.push_back({p1, p1.size()});
+        patterns.push_back({p2, p2.size()});
+    }
 
-    auto& events = it->value;
-    auto& alloc = doc.GetAllocator();
+    // Scan events, splice matching ones
+    std::string result;
+    result.reserve(raw.size());
+    result.append(data, arr_start + 1); // everything up to and including '['
 
-    // Build filtered events array: pairs at (i, i+1)
-    // Each element is [address, fill_obj], coin is in fill_obj (index 1)
-    rapidjson::Value filtered(rapidjson::kArrayType);
-    for (rapidjson::SizeType i = 0; i + 1 < events.Size(); i += 2) {
-        auto& pair_a = events[i];
-        if (!pair_a.IsArray() || pair_a.Size() < 2) continue;
-        auto& fill_obj = pair_a[1];
-        if (!fill_obj.IsObject()) continue;
-        auto coin_it = fill_obj.FindMember("coin");
-        if (coin_it == fill_obj.MemberEnd() || !coin_it->value.IsString()) continue;
-        std::string coin_str(coin_it->value.GetString(), coin_it->value.GetStringLength());
-        if (coins.count(coin_str)) {
-            filtered.PushBack(events[i], alloc);
-            filtered.PushBack(events[i + 1], alloc);
+    size_t pos = arr_start + 1;
+    bool first_match = true;
+    int match_count = 0;
+
+    while (pos < len) {
+        while (pos < len && (data[pos] == ',' || data[pos] == ' ')) ++pos;
+        if (pos >= len || data[pos] == ']') break;
+
+        size_t ev_start = pos;
+        size_t ev_end = skip_json_value(data, len, pos);
+
+        if (coin_matches(data, ev_start, ev_end, patterns)) {
+            if (!first_match) result.push_back(',');
+            result.append(data + ev_start, ev_end - ev_start);
+            first_match = false;
+            ++match_count;
+        }
+
+        pos = ev_end;
+    }
+
+    if (match_count == 0) return {};
+
+    result.push_back(']');
+    // Skip past original ']'
+    while (pos < len && data[pos] != ']') ++pos;
+    if (pos < len) ++pos;
+    result.append(data + pos, len - pos);
+    return result;
+}
+
+// Filter a fills batch JSON. Fill events come in pairs; check coin in
+// the first element of each pair and keep both elements together.
+static std::string filter_fills_line(const std::string& raw,
+                                     const std::unordered_set<std::string>& coins) {
+    const char* data = raw.data();
+    const size_t len = raw.size();
+
+    bool found_any = false;
+    for (auto& c : coins) {
+        char quoted[128];
+        quoted[0] = '"';
+        memcpy(quoted + 1, c.data(), c.size());
+        quoted[c.size() + 1] = '"';
+        quoted[c.size() + 2] = '\0';
+        if (raw.find(quoted) != std::string::npos) {
+            found_any = true;
+            break;
         }
     }
-    if (filtered.Empty()) return {};
+    if (!found_any) return {};
 
-    // Replace events array
-    it->value = std::move(filtered);
+    // Find "events" key and its array value, handling optional whitespace
+    const char* ekey = "\"events\"";
+    const char* found = strstr(data, ekey);
+    if (!found) return {};
+    size_t pos_after_key = (found - data) + strlen(ekey);
+    while (pos_after_key < len && (data[pos_after_key] == ' ' ||
+           data[pos_after_key] == ':' || data[pos_after_key] == '\t')) ++pos_after_key;
+    if (pos_after_key >= len || data[pos_after_key] != '[') return {};
+    size_t arr_start = pos_after_key; // points at '['
 
-    rapidjson::StringBuffer sb;
-    rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
-    doc.Accept(writer);
-    return std::string(sb.GetString(), sb.GetSize());
+    // Build coin patterns (both compact and spaced forms)
+    std::vector<std::pair<std::string, size_t>> patterns;
+    patterns.reserve(coins.size() * 2);
+    for (auto& c : coins) {
+        std::string p1 = "\"coin\":\"" + c + "\"";
+        std::string p2 = "\"coin\": \"" + c + "\"";
+        patterns.push_back({p1, p1.size()});
+        patterns.push_back({p2, p2.size()});
+    }
+
+    std::string result;
+    result.reserve(raw.size());
+    result.append(data, arr_start + 1);
+
+    size_t pos = arr_start + 1;
+    bool first_match = true;
+    int match_count = 0;
+
+    while (pos < len) {
+        while (pos < len && (data[pos] == ',' || data[pos] == ' ')) ++pos;
+        if (pos >= len || data[pos] == ']') break;
+
+        // Element A of pair
+        size_t a_start = pos;
+        size_t a_end = skip_json_value(data, len, pos);
+        pos = a_end;
+
+        // Skip comma between pair elements
+        while (pos < len && (data[pos] == ',' || data[pos] == ' ')) ++pos;
+        if (pos >= len || data[pos] == ']') break;
+
+        // Element B of pair
+        size_t b_start = pos;
+        size_t b_end = skip_json_value(data, len, pos);
+        pos = b_end;
+
+        // Check coin in element A
+        if (coin_matches(data, a_start, a_end, patterns)) {
+            if (!first_match) result.push_back(',');
+            result.append(data + a_start, a_end - a_start);
+            result.push_back(',');
+            result.append(data + b_start, b_end - b_start);
+            first_match = false;
+            ++match_count;
+        }
+    }
+
+    if (match_count == 0) return {};
+
+    result.push_back(']');
+    while (pos < len && data[pos] != ']') ++pos;
+    if (pos < len) ++pos;
+    result.append(data + pos, len - pos);
+    return result;
 }
 
 // ============================================================================
@@ -297,6 +399,7 @@ struct Client : public std::enable_shared_from_this<Client> {
     std::string addr;
     std::unordered_set<std::string> coins;  // empty = all (unfiltered)
     bool has_coin_filter = false;
+    std::string coin_key;                   // sorted coins joined by ',' for dedup
     std::unordered_set<char> channels;      // 'D' and/or 'F'
     std::deque<std::shared_ptr<const std::string>> write_queue;
     int consecutive_drops = 0;
@@ -397,6 +500,10 @@ public:
                 [](auto& c) { return !c->active; }),
             clients.end());
 
+        // Dedup cache: coin_key -> filtered message (shared across clients
+        // with the same coin set, computed at most once per dispatch)
+        filter_cache_.clear();
+
         for (auto& client : clients) {
             if (client->channels.count(channel) == 0) continue;
 
@@ -404,20 +511,35 @@ public:
                 // Zero-copy: share the same string
                 client->enqueue(unfiltered);
             } else {
-                // Filtered path
+                // Check dedup cache first
+                auto cache_it = filter_cache_.find(client->coin_key);
+                if (cache_it != filter_cache_.end()) {
+                    // Cache hit — reuse previously computed result
+                    if (cache_it->second)
+                        client->enqueue(cache_it->second);
+                    continue;
+                }
+
+                // Cache miss — compute filter
                 std::string filtered;
                 if (channel == 'D')
                     filtered = filter_diffs_line(raw_line, client->coins);
                 else
                     filtered = filter_fills_line(raw_line, client->coins);
 
-                if (filtered.empty()) continue;  // no matching events
+                if (filtered.empty()) {
+                    // No match — cache nullptr so we skip for other
+                    // clients with same coin set
+                    filter_cache_[client->coin_key] = nullptr;
+                    continue;
+                }
 
                 auto msg = std::make_shared<std::string>();
                 msg->reserve(prefix_len + filtered.size() + 1);
                 msg->append(prefix_buf, prefix_len);
                 msg->append(filtered);
                 msg->push_back('\n');
+                filter_cache_[client->coin_key] = msg;
                 client->enqueue(std::move(msg));
             }
         }
@@ -434,6 +556,10 @@ public:
                 [&c](auto& x) { return x.get() == c.get(); }),
             clients.end());
     }
+
+private:
+    // Per-dispatch dedup cache: coin_key -> filtered message (or nullptr if no match)
+    std::unordered_map<std::string, std::shared_ptr<const std::string>> filter_cache_;
 };
 
 // ============================================================================
@@ -800,6 +926,13 @@ private:
                     coins_it->value[i].GetStringLength()));
             }
             client_->has_coin_filter = true;
+            // Build sorted coin key for dedup cache
+            std::vector<std::string> sorted_coins(client_->coins.begin(), client_->coins.end());
+            std::sort(sorted_coins.begin(), sorted_coins.end());
+            for (auto& c : sorted_coins) {
+                if (!client_->coin_key.empty()) client_->coin_key += ',';
+                client_->coin_key += c;
+            }
         }
 
         // Parse channels
