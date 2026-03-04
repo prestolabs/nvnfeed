@@ -2,3 +2,4 @@
 __pycache__/
 benchmark/hl_client
 benchmark/hl_client_*.log
+relay/hl_relay

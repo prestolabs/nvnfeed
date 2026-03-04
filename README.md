@@ -1,6 +1,6 @@
 # hl-feed
 
-Low-latency market data feed infrastructure for a [Hyperliquid](https://hyperliquid.xyz/) non-validator node. Tails raw node data files via inotify and streams L2 book diffs and fills/trades to remote clients over TCP or WebSocket (with permessage-deflate compression).
+Low-latency market data feed infrastructure for a [Hyperliquid](https://hyperliquid.xyz/) non-validator node. Tails raw node data files via inotify and streams L2 book diffs and fills/trades to remote clients over TCP or WebSocket.
 
 ## Architecture
 
@@ -8,13 +8,16 @@ Low-latency market data feed infrastructure for a [Hyperliquid](https://hyperliq
 hl-node (non-validator)
   │  writes files to ~/hl/data/ (inotify, unbuffered)
   │
-  ├── relay/hl_relay.py          ← tails files, streams to TCP / WebSocket clients
-  │     ├── TCP  :8765           (raw line protocol, optional gzip)
-  │     └── WS   :8766           (permessage-deflate)
+  ├── relay/hl_relay.cc           ← C++ relay (Boost.Beast WS, lowest relay latency)
+  │     └── WS   :8766
   │
-  ├── benchmark/hl_client.cc     ← C++ direct file watcher (lowest latency, local only)
+  ├── relay/hl_relay.py           ← Python relay (TCP + WS, permessage-deflate)
+  │     ├── TCP  :8765            (raw line protocol, optional gzip)
+  │     └── WS   :8766            (permessage-deflate)
   │
-  └── file_latency_stats.py      ← local inotify latency measurement tool
+  ├── benchmark/hl_client.cc      ← C++ direct file watcher (local benchmark only)
+  │
+  └── file_latency_stats.py       ← local inotify latency measurement tool
 ```
 
 Remote clients connect via `clients/wsdump_deflate.py` (or any WebSocket/TCP client that speaks the wire protocol).
@@ -37,6 +40,24 @@ See [node/run-hl.sh](node/run-hl.sh) for flag documentation and caveats (e.g. `-
 
 ### 2. Start the relay
 
+**C++ relay** (recommended — lower latency, WebSocket only):
+
+```bash
+# Build and run
+bash relay/run.sh --ws-port 8766
+
+# Or build separately
+bash relay/build.sh
+./relay/hl_relay --ws-port 8766 --data-dir ~/hl/data
+```
+
+Requires `libboost-all-dev` and `rapidjson-dev`:
+```bash
+sudo apt install libboost-all-dev rapidjson-dev
+```
+
+**Python relay** (TCP + WebSocket, permessage-deflate compression):
+
 ```bash
 python3 relay/hl_relay.py --port 8765 --ws-port 8766
 ```
@@ -57,7 +78,10 @@ python3 clients/wsdump_deflate.py --latency ws://HOST:8766/ws '{"coins":["BTC","
 
 ```
 ├── relay/
-│   └── hl_relay.py              # Relay server (asyncio, inotify, TCP + WebSocket)
+│   ├── hl_relay.cc              # C++ relay (Boost.Beast, WebSocket only)
+│   ├── hl_relay.py              # Python relay (asyncio, TCP + WebSocket)
+│   ├── build.sh                 # Build script for C++ relay
+│   └── run.sh                   # Build-if-needed + run script for C++ relay
 ├── clients/
 │   └── wsdump_deflate.py        # WebSocket client with latency measurement
 ├── benchmark/
@@ -102,7 +126,22 @@ Clients must send a subscription within 10 seconds of connecting:
 
 Send `{}` or `{"coins": []}` to receive all coins (unfiltered).
 
-TCP clients can additionally request gzip compression: `{"coins": ["BTC"], "compress": true}`.
+TCP clients (Python relay only) can additionally request gzip compression: `{"coins": ["BTC"], "compress": true}`.
+
+Channel filtering is supported by both relays:
+
+```json
+{"coins": ["BTC"], "channels": ["book"]}
+{"channels": ["trade"]}
+{"coins": ["BTC", "ETH"], "channels": ["book", "trade"]}
+```
+
+| Channel name | Wire prefix | Data |
+|-------------|-------------|------|
+| `book` | `D` | L2 book diffs |
+| `trade` | `F` | Fill pairs / trades |
+
+Omitting `channels` subscribes to both (backward compatible).
 
 ### Batch-by-block JSON format
 
@@ -116,6 +155,21 @@ When the node runs with `--batch-by-block` (recommended), each JSON line wraps a
   "events": [...]
 }
 ```
+
+## Relay Comparison
+
+| | C++ (`hl_relay.cc`) | Python (`hl_relay.py`) |
+|---|---|---|
+| **Protocol** | WebSocket only | TCP + WebSocket |
+| **Compression** | None (declines permessage-deflate) | permessage-deflate (WS), gzip (TCP) |
+| **JSON library** | RapidJSON | stdlib `json` |
+| **Event loop** | Boost.Asio (single-threaded) | asyncio (single-threaded) |
+| **File I/O** | POSIX `open/read/lseek` | Python `open/read` |
+| **Zero-copy dispatch** | Yes (`shared_ptr<const string>` for unfiltered clients) | No |
+| **Build deps** | `libboost-all-dev`, `rapidjson-dev` | None (stdlib only) |
+| **Use when** | Lowest relay latency matters | Need TCP, compression, or zero-dep setup |
+
+Both relays are wire-protocol compatible — existing clients work with either.
 
 ## Latency Measurement
 

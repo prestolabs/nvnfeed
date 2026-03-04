@@ -1,0 +1,1099 @@
+// hl_relay.cc — Single-threaded async WebSocket relay for Hyperliquid node data.
+//
+// Tails hl-node data files via inotify, streams raw JSON lines to WebSocket
+// clients. Supports per-coin filtering and channel selection.
+//
+// Build: g++ -std=c++17 -O2 -o relay/hl_relay relay/hl_relay.cc -lpthread
+// Usage: ./relay/hl_relay --ws-port 8766 --data-dir ~/hl/data
+
+#include <rapidjson/document.h>
+#include <rapidjson/writer.h>
+#include <rapidjson/stringbuffer.h>
+
+#include <boost/asio.hpp>
+#include <boost/beast.hpp>
+#include <boost/beast/websocket.hpp>
+
+#include <sys/inotify.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <signal.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <ctime>
+#include <deque>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+namespace net = boost::asio;
+namespace beast = boost::beast;
+namespace websocket = beast::websocket;
+namespace http = beast::http;
+using tcp = net::ip::tcp;
+
+// ============================================================================
+// Logging
+// ============================================================================
+
+enum LogLevel { LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR };
+static LogLevel g_log_level = LOG_INFO;
+
+static void log_msg(LogLevel level, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
+static void log_msg(LogLevel level, const char* fmt, ...) {
+    if (level < g_log_level) return;
+    static const char* level_names[] = {"DEBUG", "INFO", "WARN", "ERROR"};
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    gmtime_r(&ts.tv_sec, &tm);
+    char tbuf[32];
+    snprintf(tbuf, sizeof(tbuf), "%02d:%02d:%02d.%03ld",
+             tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000);
+    fprintf(stderr, "%s %-5s hl_relay: ", tbuf, level_names[level]);
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fprintf(stderr, "\n");
+}
+
+#define LOG_D(...) log_msg(LOG_DEBUG, __VA_ARGS__)
+#define LOG_I(...) log_msg(LOG_INFO, __VA_ARGS__)
+#define LOG_W(...) log_msg(LOG_WARN, __VA_ARGS__)
+#define LOG_E(...) log_msg(LOG_ERROR, __VA_ARGS__)
+
+// ============================================================================
+// FileTailer — POSIX I/O based file tailing
+// ============================================================================
+
+struct FileTailer {
+    int fd = -1;
+    off_t file_pos = 0;
+    std::string path;
+    std::string line_buffer;
+    static constexpr size_t READ_BUF_SIZE = 65536;
+    char read_buf[READ_BUF_SIZE];
+
+    void open_at_end(const std::string& p) {
+        close();
+        path = p;
+        fd = ::open(p.c_str(), O_RDONLY);
+        if (fd >= 0)
+            file_pos = ::lseek(fd, 0, SEEK_END);
+        line_buffer.clear();
+    }
+
+    void open_at_start(const std::string& p) {
+        close();
+        path = p;
+        fd = ::open(p.c_str(), O_RDONLY);
+        file_pos = 0;
+        line_buffer.clear();
+    }
+
+    void reopen(const std::string& p) {
+        open_at_end(p);
+    }
+
+    void close() {
+        if (fd >= 0) { ::close(fd); fd = -1; }
+        line_buffer.clear();
+    }
+
+    // Read new complete lines. Incomplete trailing data is buffered.
+    std::vector<std::string> read_new_lines() {
+        std::vector<std::string> lines;
+        if (fd < 0) return lines;
+
+        ::lseek(fd, file_pos, SEEK_SET);
+        while (true) {
+            ssize_t n = ::read(fd, read_buf, READ_BUF_SIZE);
+            if (n <= 0) break;
+            line_buffer.append(read_buf, static_cast<size_t>(n));
+            file_pos += n;
+        }
+
+        size_t pos = 0;
+        while (true) {
+            size_t nl = line_buffer.find('\n', pos);
+            if (nl == std::string::npos) break;
+            if (nl > pos)
+                lines.emplace_back(line_buffer, pos, nl - pos);
+            pos = nl + 1;
+        }
+        if (pos > 0) line_buffer.erase(0, pos);
+        return lines;
+    }
+
+    ~FileTailer() { close(); }
+};
+
+// ============================================================================
+// Path helpers — UTC time-based paths
+// ============================================================================
+
+static std::string get_hourly_base(const std::string& base_dir) {
+    return base_dir + "/hourly";
+}
+
+static std::string get_current_date_dir(const std::string& base_dir) {
+    time_t now = time(nullptr);
+    struct tm tm;
+    gmtime_r(&now, &tm);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04d%02d%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+    return base_dir + "/hourly/" + buf;
+}
+
+static std::string get_current_hour_path(const std::string& base_dir) {
+    time_t now = time(nullptr);
+    struct tm tm;
+    gmtime_r(&now, &tm);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04d%02d%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+    return base_dir + "/hourly/" + buf + "/" + std::to_string(tm.tm_hour);
+}
+
+// ============================================================================
+// Coin filtering with RapidJSON
+// ============================================================================
+
+// Filter a book-diffs batch JSON to only include events for given coins.
+// Returns empty string if no matching events.
+static std::string filter_diffs_line(const std::string& raw,
+                                     const std::unordered_set<std::string>& coins) {
+    // Fast string pre-check: scan for any quoted coin name
+    bool found_any = false;
+    for (auto& c : coins) {
+        // Build quoted version on stack for small coins
+        char quoted[128];
+        if (c.size() + 2 < sizeof(quoted)) {
+            quoted[0] = '"';
+            memcpy(quoted + 1, c.data(), c.size());
+            quoted[c.size() + 1] = '"';
+            quoted[c.size() + 2] = '\0';
+            if (raw.find(quoted) != std::string::npos) {
+                found_any = true;
+                break;
+            }
+        }
+    }
+    if (!found_any) return {};
+
+    rapidjson::Document doc;
+    doc.Parse(raw.c_str(), raw.size());
+    if (doc.HasParseError() || !doc.IsObject()) return {};
+
+    auto it = doc.FindMember("events");
+    if (it == doc.MemberEnd() || !it->value.IsArray()) return {};
+
+    auto& events = it->value;
+    // Filter in place: move matching events to the front
+    rapidjson::SizeType write_idx = 0;
+    for (rapidjson::SizeType i = 0; i < events.Size(); ++i) {
+        auto& ev = events[i];
+        if (!ev.IsObject()) continue;
+        auto coin_it = ev.FindMember("coin");
+        if (coin_it == ev.MemberEnd() || !coin_it->value.IsString()) continue;
+        std::string coin_str(coin_it->value.GetString(), coin_it->value.GetStringLength());
+        if (coins.count(coin_str)) {
+            if (write_idx != i)
+                events[write_idx] = std::move(events[i]);
+            ++write_idx;
+        }
+    }
+    if (write_idx == 0) return {};
+
+    // Resize the array by popping from back
+    while (events.Size() > write_idx)
+        events.PopBack();
+
+    rapidjson::StringBuffer sb;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
+    doc.Accept(writer);
+    return std::string(sb.GetString(), sb.GetSize());
+}
+
+// Filter a fills batch JSON to only include fill pairs for given coins.
+// Fill events come in pairs (buyer + seller); keep pairs together.
+static std::string filter_fills_line(const std::string& raw,
+                                     const std::unordered_set<std::string>& coins) {
+    // Fast string pre-check
+    bool found_any = false;
+    for (auto& c : coins) {
+        char quoted[128];
+        if (c.size() + 2 < sizeof(quoted)) {
+            quoted[0] = '"';
+            memcpy(quoted + 1, c.data(), c.size());
+            quoted[c.size() + 1] = '"';
+            quoted[c.size() + 2] = '\0';
+            if (raw.find(quoted) != std::string::npos) {
+                found_any = true;
+                break;
+            }
+        }
+    }
+    if (!found_any) return {};
+
+    rapidjson::Document doc;
+    doc.Parse(raw.c_str(), raw.size());
+    if (doc.HasParseError() || !doc.IsObject()) return {};
+
+    auto it = doc.FindMember("events");
+    if (it == doc.MemberEnd() || !it->value.IsArray()) return {};
+
+    auto& events = it->value;
+    auto& alloc = doc.GetAllocator();
+
+    // Build filtered events array: pairs at (i, i+1)
+    // Each element is [address, fill_obj], coin is in fill_obj (index 1)
+    rapidjson::Value filtered(rapidjson::kArrayType);
+    for (rapidjson::SizeType i = 0; i + 1 < events.Size(); i += 2) {
+        auto& pair_a = events[i];
+        if (!pair_a.IsArray() || pair_a.Size() < 2) continue;
+        auto& fill_obj = pair_a[1];
+        if (!fill_obj.IsObject()) continue;
+        auto coin_it = fill_obj.FindMember("coin");
+        if (coin_it == fill_obj.MemberEnd() || !coin_it->value.IsString()) continue;
+        std::string coin_str(coin_it->value.GetString(), coin_it->value.GetStringLength());
+        if (coins.count(coin_str)) {
+            filtered.PushBack(events[i], alloc);
+            filtered.PushBack(events[i + 1], alloc);
+        }
+    }
+    if (filtered.Empty()) return {};
+
+    // Replace events array
+    it->value = std::move(filtered);
+
+    rapidjson::StringBuffer sb;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
+    doc.Accept(writer);
+    return std::string(sb.GetString(), sb.GetSize());
+}
+
+// ============================================================================
+// Channel map
+// ============================================================================
+
+static const std::unordered_map<std::string, char> CHANNEL_MAP = {
+    {"book", 'D'}, {"trade", 'F'}
+};
+
+// ============================================================================
+// Client state
+// ============================================================================
+
+class Relay;  // forward
+
+struct Client : public std::enable_shared_from_this<Client> {
+    websocket::stream<beast::tcp_stream> ws;
+    std::string addr;
+    std::unordered_set<std::string> coins;  // empty = all (unfiltered)
+    bool has_coin_filter = false;
+    std::unordered_set<char> channels;      // 'D' and/or 'F'
+    std::deque<std::shared_ptr<const std::string>> write_queue;
+    int consecutive_drops = 0;
+    bool writing = false;
+    bool active = true;
+    net::steady_timer deadline;
+
+    static constexpr size_t MAX_QUEUE = 2000;
+    static constexpr int MAX_CONSECUTIVE_DROPS = 500;
+
+    Client(tcp::socket&& sock)
+        : ws(std::move(sock))
+        , deadline(ws.get_executor())
+    {
+        channels.insert('D');
+        channels.insert('F');
+    }
+
+    void enqueue(std::shared_ptr<const std::string> msg) {
+        if (!active) return;
+        if (write_queue.size() >= MAX_QUEUE) {
+            ++consecutive_drops;
+            if (consecutive_drops > MAX_CONSECUTIVE_DROPS) {
+                LOG_W("Disconnecting slow consumer: %s (>%d consecutive drops)",
+                      addr.c_str(), MAX_CONSECUTIVE_DROPS);
+                active = false;
+                do_close();
+            }
+            return;
+        }
+        consecutive_drops = 0;
+        write_queue.push_back(std::move(msg));
+        kick_writer();
+    }
+
+    void kick_writer() {
+        if (writing || write_queue.empty() || !active) return;
+        writing = true;
+        auto self = shared_from_this();
+        auto& msg = write_queue.front();
+        ws.async_write(
+            net::buffer(*msg),
+            [self](beast::error_code ec, std::size_t) {
+                self->write_queue.pop_front();
+                self->writing = false;
+                if (ec) {
+                    if (ec != websocket::error::closed &&
+                        ec != net::error::operation_aborted)
+                        LOG_D("Write error for %s: %s", self->addr.c_str(), ec.message().c_str());
+                    self->active = false;
+                    return;
+                }
+                self->kick_writer();
+            });
+    }
+
+    void do_close() {
+        beast::error_code ec;
+        ws.async_close(websocket::close_code::going_away,
+            [self = shared_from_this()](beast::error_code) {});
+    }
+};
+
+// ============================================================================
+// Dispatcher
+// ============================================================================
+
+class Dispatcher {
+public:
+    uint64_t seq = 0;
+    std::vector<std::shared_ptr<Client>> clients;
+
+    uint64_t next_seq() { return ++seq; }
+
+    void dispatch(char channel, const std::string& raw_line) {
+        uint64_t s = next_seq();
+        char fmt = (raw_line.find("\"block_number\"") != std::string::npos) ? 'B' : 'L';
+
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        int64_t relay_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+
+        // Build prefix into stack buffer
+        char prefix_buf[80];
+        int prefix_len = snprintf(prefix_buf, sizeof(prefix_buf),
+                                  "%c%c %lu %ld ", channel, fmt, s, relay_ns);
+
+        // Pre-build unfiltered message
+        auto unfiltered = std::make_shared<std::string>();
+        unfiltered->reserve(prefix_len + raw_line.size() + 1);
+        unfiltered->append(prefix_buf, prefix_len);
+        unfiltered->append(raw_line);
+        unfiltered->push_back('\n');
+
+        // Remove inactive clients
+        clients.erase(
+            std::remove_if(clients.begin(), clients.end(),
+                [](auto& c) { return !c->active; }),
+            clients.end());
+
+        for (auto& client : clients) {
+            if (client->channels.count(channel) == 0) continue;
+
+            if (!client->has_coin_filter) {
+                // Zero-copy: share the same string
+                client->enqueue(unfiltered);
+            } else {
+                // Filtered path
+                std::string filtered;
+                if (channel == 'D')
+                    filtered = filter_diffs_line(raw_line, client->coins);
+                else
+                    filtered = filter_fills_line(raw_line, client->coins);
+
+                if (filtered.empty()) continue;  // no matching events
+
+                auto msg = std::make_shared<std::string>();
+                msg->reserve(prefix_len + filtered.size() + 1);
+                msg->append(prefix_buf, prefix_len);
+                msg->append(filtered);
+                msg->push_back('\n');
+                client->enqueue(std::move(msg));
+            }
+        }
+    }
+
+    void add_client(std::shared_ptr<Client> c) {
+        clients.push_back(std::move(c));
+    }
+
+    void remove_client(const std::shared_ptr<Client>& c) {
+        c->active = false;
+        clients.erase(
+            std::remove_if(clients.begin(), clients.end(),
+                [&c](auto& x) { return x.get() == c.get(); }),
+            clients.end());
+    }
+};
+
+// ============================================================================
+// InotifyWatcher
+// ============================================================================
+
+class InotifyWatcher {
+public:
+    InotifyWatcher(net::io_context& ioc, Dispatcher& dispatcher,
+                   const std::string& data_dir)
+        : ioc_(ioc)
+        , dispatcher_(dispatcher)
+        , data_dir_(data_dir)
+        , book_base_(data_dir + "/node_raw_book_diffs_by_block")
+        , fills_base_(data_dir + "/node_fills_by_block")
+        , rotation_timer_(ioc)
+        , inotify_sd_(ioc)
+    {
+        ifd_ = inotify_init1(IN_NONBLOCK);
+        if (ifd_ < 0)
+            throw std::runtime_error("Failed to initialize inotify");
+        inotify_sd_.assign(ifd_);
+    }
+
+    void start() {
+        setup_watches();
+        start_inotify_read();
+        start_rotation_timer();
+    }
+
+    void stop() {
+        rotation_timer_.cancel();
+        inotify_sd_.cancel();
+        for (auto& [key, tailer] : tailers_)
+            tailer.close();
+        // inotify fd closed when stream_descriptor is destroyed
+    }
+
+private:
+    net::io_context& ioc_;
+    Dispatcher& dispatcher_;
+    std::string data_dir_;
+    std::string book_base_;
+    std::string fills_base_;
+    net::steady_timer rotation_timer_;
+    int ifd_ = -1;
+    net::posix::stream_descriptor inotify_sd_;
+
+    // wd -> (source_type, path)
+    std::unordered_map<int, std::pair<std::string, std::string>> watch_map_;
+    std::unordered_map<std::string, FileTailer> tailers_;  // "book" / "fills"
+
+    static constexpr size_t INOTIFY_BUF_SIZE = 65536;
+    char inotify_buf_[INOTIFY_BUF_SIZE];
+
+    int add_watch(const std::string& path, const std::string& source_type, uint32_t mask) {
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0) return -1;
+        int wd = inotify_add_watch(ifd_, path.c_str(), mask);
+        if (wd >= 0) {
+            watch_map_[wd] = {source_type, path};
+            LOG_D("Added watch: wd=%d type=%s path=%s", wd, source_type.c_str(), path.c_str());
+        } else {
+            LOG_W("Failed to add watch: type=%s path=%s", source_type.c_str(), path.c_str());
+        }
+        return wd;
+    }
+
+    void remove_watch(int wd) {
+        inotify_rm_watch(ifd_, wd);
+        watch_map_.erase(wd);
+    }
+
+    void setup_watches() {
+        struct { std::string base; std::string src_type; } sources[] = {
+            {book_base_, "book"},
+            {fills_base_, "fills"},
+        };
+
+        for (auto& [base, src_type] : sources) {
+            // Watch hourly base dir for new date dirs (midnight rotation)
+            std::string hourly_base = get_hourly_base(base);
+            // Ensure directory exists
+            mkdir(hourly_base.c_str(), 0755);
+            add_watch(hourly_base, src_type + "_hourly_base", IN_CREATE);
+
+            // Watch current date dir for new hour files
+            std::string date_dir = get_current_date_dir(base);
+            mkdir(date_dir.c_str(), 0755);
+            add_watch(date_dir, src_type + "_date_dir", IN_CREATE);
+
+            // Set up tailer for current hour file
+            std::string hour_path = get_current_hour_path(base);
+            struct stat st;
+            if (stat(hour_path.c_str(), &st) == 0) {
+                add_watch(hour_path, src_type, IN_MODIFY);
+                tailers_[src_type].open_at_end(hour_path);
+                LOG_I("Tailing %s: %s", src_type.c_str(), hour_path.c_str());
+            } else {
+                LOG_I("Waiting for %s file: %s", src_type.c_str(), hour_path.c_str());
+            }
+        }
+    }
+
+    void start_inotify_read() {
+        inotify_sd_.async_read_some(
+            net::buffer(inotify_buf_, INOTIFY_BUF_SIZE),
+            [this](beast::error_code ec, std::size_t bytes_read) {
+                if (ec) {
+                    if (ec != net::error::operation_aborted)
+                        LOG_E("inotify read error: %s", ec.message().c_str());
+                    return;
+                }
+                process_inotify_events(bytes_read);
+                // Poll all tailers after processing events
+                read_and_dispatch("book");
+                read_and_dispatch("fills");
+                start_inotify_read();
+            });
+    }
+
+    void process_inotify_events(std::size_t bytes_read) {
+        size_t offset = 0;
+        while (offset + sizeof(struct inotify_event) <= bytes_read) {
+            auto* event = reinterpret_cast<struct inotify_event*>(inotify_buf_ + offset);
+            size_t event_size = sizeof(struct inotify_event) + event->len;
+            if (offset + event_size > bytes_read) break;
+
+            int wd = event->wd;
+            auto it = watch_map_.find(wd);
+            if (it == watch_map_.end()) {
+                offset += event_size;
+                continue;
+            }
+
+            auto& [src_type, path] = it->second;
+            std::string name;
+            if (event->len > 0)
+                name = std::string(event->name);
+
+            if (src_type.find("_hourly_base") != std::string::npos && (event->mask & IN_CREATE)) {
+                // New date directory created (midnight)
+                std::string base_type = src_type.substr(0, src_type.find("_hourly_base"));
+                std::string new_date_dir = path + "/" + name;
+                add_watch(new_date_dir, base_type + "_date_dir", IN_CREATE);
+                LOG_I("New date dir: %s", new_date_dir.c_str());
+            }
+            else if (src_type.find("_date_dir") != std::string::npos && (event->mask & IN_CREATE)) {
+                // New hour file created
+                std::string base_type = src_type.substr(0, src_type.find("_date_dir"));
+                std::string new_hour_path = path + "/" + name;
+
+                // Remove old hour-file watch
+                for (auto wit = watch_map_.begin(); wit != watch_map_.end(); ++wit) {
+                    if (wit->second.first == base_type && wit->first != wd) {
+                        remove_watch(wit->first);
+                        break;
+                    }
+                }
+
+                add_watch(new_hour_path, base_type, IN_MODIFY);
+                tailers_[base_type].open_at_start(new_hour_path);
+                LOG_I("New hour file for %s: %s", base_type.c_str(), new_hour_path.c_str());
+                // Read immediately
+                read_and_dispatch(base_type);
+            }
+            else if ((src_type == "book" || src_type == "fills") && (event->mask & IN_MODIFY)) {
+                read_and_dispatch(src_type);
+            }
+
+            offset += event_size;
+        }
+    }
+
+    void read_and_dispatch(const std::string& src_type) {
+        auto it = tailers_.find(src_type);
+        if (it == tailers_.end()) return;
+        char channel = (src_type == "book") ? 'D' : 'F';
+        auto lines = it->second.read_new_lines();
+        for (auto& line : lines)
+            dispatcher_.dispatch(channel, line);
+    }
+
+    void start_rotation_timer() {
+        rotation_timer_.expires_after(std::chrono::seconds(1));
+        rotation_timer_.async_wait([this](beast::error_code ec) {
+            if (ec) return;
+            check_rotation();
+            // Also poll tailers as safety net
+            read_and_dispatch("book");
+            read_and_dispatch("fills");
+            start_rotation_timer();
+        });
+    }
+
+    void check_rotation() {
+        struct { std::string base; std::string src_type; } sources[] = {
+            {book_base_, "book"},
+            {fills_base_, "fills"},
+        };
+
+        for (auto& [base, src_type] : sources) {
+            // Check for new date dir
+            std::string date_dir = get_current_date_dir(base);
+            std::string date_key = src_type + "_date_dir";
+            bool has_date_watch = false;
+            for (auto& [wd, info] : watch_map_) {
+                if (info.first == date_key && info.second == date_dir) {
+                    has_date_watch = true;
+                    break;
+                }
+            }
+            if (!has_date_watch) {
+                struct stat st;
+                if (stat(date_dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+                    add_watch(date_dir, date_key, IN_CREATE);
+                    LOG_I("Rotation: watching new date dir %s", date_dir.c_str());
+                }
+            }
+
+            // Check for new hour file
+            std::string hour_path = get_current_hour_path(base);
+            auto tailer_it = tailers_.find(src_type);
+            if (tailer_it != tailers_.end() && tailer_it->second.path != hour_path) {
+                struct stat st;
+                if (stat(hour_path.c_str(), &st) == 0) {
+                    // Remove old hour-file watch
+                    for (auto wit = watch_map_.begin(); wit != watch_map_.end(); ++wit) {
+                        if (wit->second.first == src_type) {
+                            remove_watch(wit->first);
+                            break;
+                        }
+                    }
+                    add_watch(hour_path, src_type, IN_MODIFY);
+                    tailer_it->second.open_at_start(hour_path);
+                    LOG_I("Rotation: new hour file for %s: %s", src_type.c_str(), hour_path.c_str());
+                    read_and_dispatch(src_type);
+                }
+            } else if (tailer_it == tailers_.end()) {
+                struct stat st;
+                if (stat(hour_path.c_str(), &st) == 0) {
+                    add_watch(hour_path, src_type, IN_MODIFY);
+                    tailers_[src_type].open_at_start(hour_path);
+                    LOG_I("First hour file for %s: %s", src_type.c_str(), hour_path.c_str());
+                    read_and_dispatch(src_type);
+                }
+            }
+        }
+    }
+};
+
+// ============================================================================
+// WebSocket session
+// ============================================================================
+
+class WsSession : public std::enable_shared_from_this<WsSession> {
+public:
+    WsSession(tcp::socket&& socket, Dispatcher& dispatcher)
+        : client_(std::make_shared<Client>(std::move(socket)))
+        , dispatcher_(dispatcher)
+    {
+    }
+
+    void run() {
+        // Set TCP_NODELAY
+        beast::error_code ec;
+        client_->ws.next_layer().socket().set_option(tcp::no_delay(true), ec);
+
+        // Get remote address before the handshake
+        auto ep = client_->ws.next_layer().socket().remote_endpoint(ec);
+        if (!ec)
+            client_->addr = ep.address().to_string() + ":" + std::to_string(ep.port());
+        else
+            client_->addr = "unknown";
+
+        // Disable permessage-deflate
+        websocket::permessage_deflate pmd;
+        pmd.server_enable = false;
+        pmd.client_enable = false;
+        client_->ws.set_option(pmd);
+
+        // Set auto-fragment off for lower latency
+        client_->ws.auto_fragment(false);
+
+        // Accept the WebSocket upgrade
+        client_->ws.set_option(websocket::stream_base::decorator(
+            [](websocket::response_type& res) {
+                res.set(http::field::server, "hl_relay/cpp");
+            }));
+
+        auto self = shared_from_this();
+        client_->ws.async_accept(
+            [self](beast::error_code ec) {
+                if (ec) {
+                    LOG_D("WS accept error from %s: %s",
+                          self->client_->addr.c_str(), ec.message().c_str());
+                    return;
+                }
+                LOG_I("WS client connected: %s", self->client_->addr.c_str());
+                self->start_subscription_deadline();
+                self->do_read_subscription();
+            });
+    }
+
+private:
+    std::shared_ptr<Client> client_;
+    Dispatcher& dispatcher_;
+    beast::flat_buffer read_buf_;
+
+    void start_subscription_deadline() {
+        client_->deadline.expires_after(std::chrono::seconds(10));
+        auto self = shared_from_this();
+        client_->deadline.async_wait(
+            [self](beast::error_code ec) {
+                if (ec) return;  // cancelled = subscription arrived in time
+                if (!self->client_->active) return;
+                LOG_W("WS client %s: no subscription within 10s, disconnecting",
+                      self->client_->addr.c_str());
+                self->send_error("subscription required within 10s");
+            });
+    }
+
+    void do_read_subscription() {
+        auto self = shared_from_this();
+        client_->ws.async_read(
+            read_buf_,
+            [self](beast::error_code ec, std::size_t) {
+                if (ec) {
+                    if (ec != websocket::error::closed &&
+                        ec != net::error::operation_aborted)
+                        LOG_D("WS read error from %s: %s",
+                              self->client_->addr.c_str(), ec.message().c_str());
+                    self->client_->active = false;
+                    self->client_->deadline.cancel();
+                    return;
+                }
+                self->client_->deadline.cancel();
+                self->handle_subscription();
+            });
+    }
+
+    void handle_subscription() {
+        auto data = beast::buffers_to_string(read_buf_.data());
+        read_buf_.consume(read_buf_.size());
+
+        rapidjson::Document doc;
+        doc.Parse(data.c_str(), data.size());
+        if (doc.HasParseError() || !doc.IsObject()) {
+            LOG_W("WS client %s: invalid subscription JSON", client_->addr.c_str());
+            send_error("invalid subscription JSON");
+            return;
+        }
+
+        // Parse coins
+        auto coins_it = doc.FindMember("coins");
+        if (coins_it != doc.MemberEnd() && coins_it->value.IsArray() && coins_it->value.Size() > 0) {
+            for (rapidjson::SizeType i = 0; i < coins_it->value.Size(); ++i) {
+                if (!coins_it->value[i].IsString()) {
+                    send_error("coins must be array of strings");
+                    return;
+                }
+                client_->coins.insert(std::string(
+                    coins_it->value[i].GetString(),
+                    coins_it->value[i].GetStringLength()));
+            }
+            client_->has_coin_filter = true;
+        }
+
+        // Parse channels
+        auto ch_it = doc.FindMember("channels");
+        if (ch_it != doc.MemberEnd() && ch_it->value.IsArray() && ch_it->value.Size() > 0) {
+            std::unordered_set<char> parsed;
+            for (rapidjson::SizeType i = 0; i < ch_it->value.Size(); ++i) {
+                if (!ch_it->value[i].IsString()) continue;
+                std::string ch_name(ch_it->value[i].GetString(), ch_it->value[i].GetStringLength());
+                auto map_it = CHANNEL_MAP.find(ch_name);
+                if (map_it != CHANNEL_MAP.end())
+                    parsed.insert(map_it->second);
+            }
+            if (!parsed.empty())
+                client_->channels = std::move(parsed);
+        }
+
+        // Register with dispatcher
+        dispatcher_.add_client(client_);
+
+        // Build confirmation message
+        send_subscription_confirmation();
+
+        // Enter read loop (handle ping/pong/close via Beast)
+        do_read_loop();
+    }
+
+    void send_subscription_confirmation() {
+        // Build response JSON
+        rapidjson::StringBuffer sb;
+        rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
+        writer.StartObject();
+        writer.Key("status"); writer.String("subscribed");
+
+        writer.Key("coins");
+        if (client_->has_coin_filter) {
+            std::vector<std::string> sorted_coins(client_->coins.begin(), client_->coins.end());
+            std::sort(sorted_coins.begin(), sorted_coins.end());
+            writer.StartArray();
+            for (auto& c : sorted_coins) writer.String(c.c_str());
+            writer.EndArray();
+        } else {
+            writer.String("all");
+        }
+
+        writer.Key("channels");
+        {
+            std::vector<std::string> ch_names;
+            for (char c : client_->channels) {
+                if (c == 'D') ch_names.push_back("book");
+                else if (c == 'F') ch_names.push_back("trade");
+            }
+            std::sort(ch_names.begin(), ch_names.end());
+            writer.StartArray();
+            for (auto& n : ch_names) writer.String(n.c_str());
+            writer.EndArray();
+        }
+        writer.EndObject();
+
+        std::string ctrl = "C 0 " + std::string(sb.GetString(), sb.GetSize()) + "\n";
+        auto msg = std::make_shared<std::string>(std::move(ctrl));
+        client_->enqueue(std::move(msg));
+
+        // Log
+        std::string coins_str = client_->has_coin_filter ? "" : "all";
+        if (client_->has_coin_filter) {
+            for (auto& c : client_->coins) {
+                if (!coins_str.empty()) coins_str += ",";
+                coins_str += c;
+            }
+        }
+        std::string ch_str;
+        for (char c : client_->channels) {
+            if (!ch_str.empty()) ch_str += ",";
+            ch_str += c;
+        }
+        LOG_I("WS client %s subscribed: coins=%s channels=%s",
+              client_->addr.c_str(), coins_str.c_str(), ch_str.c_str());
+    }
+
+    void do_read_loop() {
+        auto self = shared_from_this();
+        client_->ws.async_read(
+            read_buf_,
+            [self](beast::error_code ec, std::size_t) {
+                if (ec) {
+                    if (ec != websocket::error::closed &&
+                        ec != net::error::operation_aborted)
+                        LOG_D("WS client %s disconnected: %s",
+                              self->client_->addr.c_str(), ec.message().c_str());
+                    self->cleanup();
+                    return;
+                }
+                // Discard any data frames from the client (we don't expect any)
+                self->read_buf_.consume(self->read_buf_.size());
+                self->do_read_loop();
+            });
+    }
+
+    void send_error(const char* msg) {
+        rapidjson::StringBuffer sb;
+        rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
+        writer.StartObject();
+        writer.Key("status"); writer.String("error");
+        writer.Key("msg"); writer.String(msg);
+        writer.EndObject();
+
+        std::string ctrl = "C 0 " + std::string(sb.GetString(), sb.GetSize()) + "\n";
+
+        auto self = shared_from_this();
+        auto buf = std::make_shared<std::string>(std::move(ctrl));
+        client_->ws.text(true);
+        client_->ws.async_write(
+            net::buffer(*buf),
+            [self, buf](beast::error_code, std::size_t) {
+                // Close after sending error
+                self->client_->ws.async_close(websocket::close_code::protocol_error,
+                    [self](beast::error_code) {
+                        self->cleanup();
+                    });
+            });
+    }
+
+    void cleanup() {
+        client_->active = false;
+        dispatcher_.remove_client(client_);
+        LOG_I("WS client disconnected: %s", client_->addr.c_str());
+    }
+};
+
+// ============================================================================
+// WebSocket listener (acceptor)
+// ============================================================================
+
+class WsListener : public std::enable_shared_from_this<WsListener> {
+public:
+    WsListener(net::io_context& ioc, tcp::endpoint endpoint, Dispatcher& dispatcher)
+        : ioc_(ioc)
+        , acceptor_(ioc)
+        , dispatcher_(dispatcher)
+    {
+        beast::error_code ec;
+        acceptor_.open(endpoint.protocol(), ec);
+        if (ec) {
+            LOG_E("acceptor open: %s", ec.message().c_str());
+            throw std::runtime_error("Failed to open acceptor: " + ec.message());
+        }
+
+        acceptor_.set_option(net::socket_base::reuse_address(true), ec);
+        acceptor_.bind(endpoint, ec);
+        if (ec) {
+            LOG_E("acceptor bind on port %d: %s", endpoint.port(), ec.message().c_str());
+            throw std::runtime_error("Failed to bind port " +
+                std::to_string(endpoint.port()) + ": " + ec.message());
+        }
+
+        acceptor_.listen(net::socket_base::max_listen_connections, ec);
+        if (ec) {
+            LOG_E("acceptor listen: %s", ec.message().c_str());
+            throw std::runtime_error("Failed to listen: " + ec.message());
+        }
+
+        LOG_I("WebSocket server listening on %s:%d",
+              endpoint.address().to_string().c_str(), endpoint.port());
+    }
+
+    void run() { do_accept(); }
+
+    void stop() {
+        beast::error_code ec;
+        acceptor_.close(ec);
+    }
+
+private:
+    net::io_context& ioc_;
+    tcp::acceptor acceptor_;
+    Dispatcher& dispatcher_;
+
+    void do_accept() {
+        auto self = shared_from_this();
+        acceptor_.async_accept(
+            net::make_strand(ioc_),
+            [self](beast::error_code ec, tcp::socket socket) {
+                if (ec) {
+                    if (ec != net::error::operation_aborted)
+                        LOG_E("Accept error: %s", ec.message().c_str());
+                    return;
+                }
+                std::make_shared<WsSession>(std::move(socket), self->dispatcher_)->run();
+                self->do_accept();
+            });
+    }
+};
+
+// ============================================================================
+// Config
+// ============================================================================
+
+struct Config {
+    std::string host = "0.0.0.0";
+    uint16_t ws_port = 8766;
+    std::string data_dir;
+    bool verbose = false;
+
+    Config() {
+        const char* home = getenv("HOME");
+        data_dir = std::string(home ? home : "/root") + "/hl/data";
+    }
+};
+
+static Config parse_args(int argc, char* argv[]) {
+    Config cfg;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if ((arg == "--ws-port" || arg == "--port") && i + 1 < argc)
+            cfg.ws_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        else if (arg == "--host" && i + 1 < argc)
+            cfg.host = argv[++i];
+        else if (arg == "--data-dir" && i + 1 < argc)
+            cfg.data_dir = argv[++i];
+        else if (arg == "--verbose" || arg == "-v")
+            cfg.verbose = true;
+        else if (arg == "--help" || arg == "-h") {
+            fprintf(stderr,
+                "Usage: %s [options]\n"
+                "  --ws-port PORT    WebSocket listen port (default: 8766)\n"
+                "  --host ADDR       Bind address (default: 0.0.0.0)\n"
+                "  --data-dir PATH   Node data directory (default: ~/hl/data)\n"
+                "  --verbose, -v     Enable debug logging\n",
+                argv[0]);
+            exit(0);
+        }
+    }
+    return cfg;
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+int main(int argc, char* argv[]) {
+    Config cfg = parse_args(argc, argv);
+    if (cfg.verbose) g_log_level = LOG_DEBUG;
+
+    // Ignore SIGPIPE
+    signal(SIGPIPE, SIG_IGN);
+
+    LOG_I("Starting hl_relay (C++): ws-port=%d data_dir=%s", cfg.ws_port, cfg.data_dir.c_str());
+
+    // Verify data directory exists
+    struct stat st;
+    if (stat(cfg.data_dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+        LOG_W("Data directory does not exist: %s", cfg.data_dir.c_str());
+    }
+
+    net::io_context ioc{1};  // single-threaded
+
+    Dispatcher dispatcher;
+
+    // Set up WebSocket listener — fatal if port is unavailable
+    std::shared_ptr<WsListener> listener;
+    try {
+        listener = std::make_shared<WsListener>(
+            ioc,
+            tcp::endpoint(net::ip::make_address(cfg.host), cfg.ws_port),
+            dispatcher);
+    } catch (const std::exception& e) {
+        LOG_E("Fatal: %s", e.what());
+        return 1;
+    }
+    listener->run();
+
+    // Set up inotify watcher
+    InotifyWatcher watcher(ioc, dispatcher, cfg.data_dir);
+    watcher.start();
+
+    // Signal handling
+    net::signal_set signals(ioc, SIGINT, SIGTERM);
+    signals.async_wait([&](beast::error_code, int sig) {
+        LOG_I("Received signal %d, shutting down", sig);
+        listener->stop();
+        watcher.stop();
+        // Close all client connections
+        for (auto& client : dispatcher.clients) {
+            client->active = false;
+            beast::error_code ec;
+            client->ws.next_layer().socket().close(ec);
+        }
+        ioc.stop();
+    });
+
+    LOG_I("Event loop running");
+    ioc.run();
+
+    LOG_I("Shutdown complete");
+    return 0;
+}
