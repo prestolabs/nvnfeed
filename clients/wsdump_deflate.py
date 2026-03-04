@@ -97,15 +97,16 @@ class LatencyTracker:
 
     def _print_section(self, title: str, datasets: list[tuple[str, list[float]]]):
         print(f"  {title}", file=sys.stderr)
-        print(f"{'':>12s}  {'p25':>8s}  {'p50':>8s}  {'p75':>8s}  {'p99':>8s}  {'max':>8s}",
+        print(f"{'':>12s}  {'avg':>8s}  {'p25':>8s}  {'p50':>8s}  {'p75':>8s}  {'p99':>8s}  {'max':>8s}",
               file=sys.stderr)
         for label, data in datasets:
+            avg = sum(data) / len(data) if data else 0.0
             p25 = self._pct(data, 25)
             p50 = self._pct(data, 50)
             p75 = self._pct(data, 75)
             p99 = self._pct(data, 99)
             mx = max(data) if data else 0.0
-            print(f"  {label:>10s}: {p25:7.1f}ms {p50:7.1f}ms {p75:7.1f}ms {p99:7.1f}ms {mx:7.1f}ms",
+            print(f"  {label:>10s}: {avg:7.1f}ms {p25:7.1f}ms {p50:7.1f}ms {p75:7.1f}ms {p99:7.1f}ms {mx:7.1f}ms",
                   file=sys.stderr)
 
     def _print_stats(self):
