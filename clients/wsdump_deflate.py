@@ -48,11 +48,18 @@ class LatencyTracker:
 
     def __init__(self, interval: float = 10.0):
         self.interval = interval
-        self.node: list[float] = []      # local_time - block_time (ms)
-        self.relay: list[float] = []     # relay_ns - local_time (ms)
-        self.network: list[float] = []   # client_recv - relay_ns (ms)
-        self.e2e: list[float] = []       # client_recv - block_time (ms)
+        # Window (reset each interval)
+        self.node: list[float] = []
+        self.relay: list[float] = []
+        self.network: list[float] = []
+        self.e2e: list[float] = []
+        # Accumulated (never reset)
+        self.all_node: list[float] = []
+        self.all_relay: list[float] = []
+        self.all_network: list[float] = []
+        self.all_e2e: list[float] = []
         self._last_report = time.monotonic()
+        self._start = time.monotonic()
 
     def record(self, block_time_ns: int, local_time_ns: int,
                relay_ns: int, recv_ns: int, channel: str, block_num: int):
@@ -65,6 +72,10 @@ class LatencyTracker:
         self.relay.append(relay_ms)
         self.network.append(net_ms)
         self.e2e.append(e2e_ms)
+        self.all_node.append(node_ms)
+        self.all_relay.append(relay_ms)
+        self.all_network.append(net_ms)
+        self.all_e2e.append(e2e_ms)
 
         # Per-message compact line
         print(f"[{channel}] blk={block_num} "
@@ -84,16 +95,11 @@ class LatencyTracker:
         idx = int(len(s) * p / 100)
         return s[min(idx, len(s) - 1)]
 
-    def _print_stats(self):
-        n = len(self.e2e)
-        if n == 0:
-            return
-        print(f"\n--- Latency stats (last {self.interval:.0f}s, {n} msgs) ---",
-              file=sys.stderr)
+    def _print_section(self, title: str, datasets: list[tuple[str, list[float]]]):
+        print(f"  {title}", file=sys.stderr)
         print(f"{'':>12s}  {'p25':>8s}  {'p50':>8s}  {'p75':>8s}  {'p99':>8s}  {'max':>8s}",
               file=sys.stderr)
-        for label, data in [("e2e", self.e2e), ("node", self.node),
-                            ("relay", self.relay), ("network", self.network)]:
+        for label, data in datasets:
             p25 = self._pct(data, 25)
             p50 = self._pct(data, 50)
             p75 = self._pct(data, 75)
@@ -101,8 +107,29 @@ class LatencyTracker:
             mx = max(data) if data else 0.0
             print(f"  {label:>10s}: {p25:7.1f}ms {p50:7.1f}ms {p75:7.1f}ms {p99:7.1f}ms {mx:7.1f}ms",
                   file=sys.stderr)
+
+    def _print_stats(self):
+        n = len(self.e2e)
+        n_all = len(self.all_e2e)
+        if n == 0 and n_all == 0:
+            return
+        elapsed = time.monotonic() - self._start
+        print(f"\n--- Latency stats ---", file=sys.stderr)
+
+        if n > 0:
+            self._print_section(
+                f"Last {self.interval:.0f}s ({n} msgs):",
+                [("e2e", self.e2e), ("node", self.node),
+                 ("relay", self.relay), ("network", self.network)])
+
+        if n_all > 0:
+            self._print_section(
+                f"Accumulated ({n_all} msgs, {elapsed:.0f}s):",
+                [("e2e", self.all_e2e), ("node", self.all_node),
+                 ("relay", self.all_relay), ("network", self.all_network)])
+
         print(file=sys.stderr, flush=True)
-        # Reset for next window
+        # Reset window
         self.node.clear()
         self.relay.clear()
         self.network.clear()
