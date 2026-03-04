@@ -4,7 +4,9 @@ and latency measurement.
 
 Usage:
   python3 wsdump_deflate.py ws://host:port/ws '{"coins":["BTC"]}'
-  python3 wsdump_deflate.py --latency ws://host:port/ws '{"coins":["BTC"]}'
+  python3 wsdump_deflate.py --coins BTC,ETH,SOL ws://host:port/ws
+  python3 wsdump_deflate.py --coins BTC --channels book ws://host:port/ws
+  python3 wsdump_deflate.py --latency --coins BTC,ETH ws://host:port/ws
   python3 wsdump_deflate.py --no-compress ws://host:port/ws '{"coins":["BTC"]}'
 """
 
@@ -88,15 +90,16 @@ class LatencyTracker:
             return
         print(f"\n--- Latency stats (last {self.interval:.0f}s, {n} msgs) ---",
               file=sys.stderr)
-        print(f"{'':>12s}  {'p50':>8s}  {'p90':>8s}  {'p99':>8s}  {'max':>8s}",
+        print(f"{'':>12s}  {'p25':>8s}  {'p50':>8s}  {'p75':>8s}  {'p99':>8s}  {'max':>8s}",
               file=sys.stderr)
         for label, data in [("e2e", self.e2e), ("node", self.node),
                             ("relay", self.relay), ("network", self.network)]:
+            p25 = self._pct(data, 25)
             p50 = self._pct(data, 50)
-            p90 = self._pct(data, 90)
+            p75 = self._pct(data, 75)
             p99 = self._pct(data, 99)
             mx = max(data) if data else 0.0
-            print(f"  {label:>10s}: {p50:7.1f}ms {p90:7.1f}ms {p99:7.1f}ms {mx:7.1f}ms",
+            print(f"  {label:>10s}: {p25:7.1f}ms {p50:7.1f}ms {p75:7.1f}ms {p99:7.1f}ms {mx:7.1f}ms",
                   file=sys.stderr)
         print(file=sys.stderr, flush=True)
         # Reset for next window
@@ -111,6 +114,10 @@ async def main():
     parser.add_argument("ws_url", help="WebSocket URL, e.g. ws://host:port/ws")
     parser.add_argument("subscription", nargs="?", default="{}",
                         help='Subscription JSON (default: "{}")')
+    parser.add_argument("--coins", type=str, default=None,
+                        help="Comma-separated coin filter, e.g. BTC,ETH,SOL")
+    parser.add_argument("--channels", type=str, default=None,
+                        help="Comma-separated channel filter, e.g. book,trade")
     parser.add_argument("--no-compress", action="store_true",
                         help="Disable permessage-deflate compression")
     parser.add_argument("--latency", action="store_true",
@@ -120,7 +127,16 @@ async def main():
     args = parser.parse_args()
 
     url = urlparse(args.ws_url)
-    sub = args.subscription
+    # Build subscription: --coins/--channels override the positional JSON arg
+    if args.coins or args.channels:
+        sub_obj = {}
+        if args.coins:
+            sub_obj["coins"] = [c.strip() for c in args.coins.split(",") if c.strip()]
+        if args.channels:
+            sub_obj["channels"] = [c.strip() for c in args.channels.split(",") if c.strip()]
+        sub = json.dumps(sub_obj)
+    else:
+        sub = args.subscription
     host = url.hostname
     port = url.port or (443 if url.scheme == "wss" else 80)
     path = url.path or "/"
