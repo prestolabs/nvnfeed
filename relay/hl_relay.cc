@@ -177,7 +177,7 @@ static size_t skip_json_value(const char* data, size_t len, size_t pos) {
         while (pos < len && depth > 0) {
             char c = data[pos];
             if (in_str) {
-                if (c == '\\') { pos += 2; continue; }
+                if (c == '\\') { pos = std::min(len, pos + size_t{2}); continue; }
                 if (c == '"') in_str = false;
             } else {
                 if (c == '"') in_str = true;
@@ -191,7 +191,7 @@ static size_t skip_json_value(const char* data, size_t len, size_t pos) {
     if (ch == '"') {
         ++pos;
         while (pos < len) {
-            if (data[pos] == '\\') { pos += 2; continue; }
+            if (data[pos] == '\\') { pos = std::min(len, pos + size_t{2}); continue; }
             if (data[pos] == '"') return pos + 1;
             ++pos;
         }
@@ -206,9 +206,24 @@ static size_t skip_json_value(const char* data, size_t len, size_t pos) {
 // Check if any coin pattern matches within [start, end) of data
 static bool coin_matches(const char* data, size_t start, size_t end,
                           const std::vector<std::pair<std::string, size_t>>& patterns) {
+    if (start >= end) return false;
     std::string_view view(data + start, end - start);
     for (auto& [pat, pat_len] : patterns) {
         if (view.find(std::string_view(pat.data(), pat_len)) != std::string_view::npos)
+            return true;
+    }
+    return false;
+}
+
+static bool contains_any_quoted_coin(const std::string& raw,
+                                     const std::unordered_set<std::string>& coins) {
+    for (const auto& c : coins) {
+        std::string quoted;
+        quoted.reserve(c.size() + 2);
+        quoted.push_back('"');
+        quoted.append(c);
+        quoted.push_back('"');
+        if (raw.find(quoted) != std::string::npos)
             return true;
     }
     return false;
@@ -222,19 +237,7 @@ static std::string filter_diffs_line(const std::string& raw,
     const size_t len = raw.size();
 
     // Fast string pre-check
-    bool found_any = false;
-    for (auto& c : coins) {
-        char quoted[128];
-        quoted[0] = '"';
-        memcpy(quoted + 1, c.data(), c.size());
-        quoted[c.size() + 1] = '"';
-        quoted[c.size() + 2] = '\0';
-        if (raw.find(quoted) != std::string::npos) {
-            found_any = true;
-            break;
-        }
-    }
-    if (!found_any) return {};
+    if (!contains_any_quoted_coin(raw, coins)) return {};
 
     // Find "events" key and its array value, handling optional whitespace
     const char* ekey = "\"events\"";
@@ -300,19 +303,7 @@ static std::string filter_fills_line(const std::string& raw,
     const char* data = raw.data();
     const size_t len = raw.size();
 
-    bool found_any = false;
-    for (auto& c : coins) {
-        char quoted[128];
-        quoted[0] = '"';
-        memcpy(quoted + 1, c.data(), c.size());
-        quoted[c.size() + 1] = '"';
-        quoted[c.size() + 2] = '\0';
-        if (raw.find(quoted) != std::string::npos) {
-            found_any = true;
-            break;
-        }
-    }
-    if (!found_any) return {};
+    if (!contains_any_quoted_coin(raw, coins)) return {};
 
     // Find "events" key and its array value, handling optional whitespace
     const char* ekey = "\"events\"";
@@ -1147,8 +1138,28 @@ static Config parse_args(int argc, char* argv[]) {
     Config cfg;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if ((arg == "--ws-port" || arg == "--port") && i + 1 < argc)
-            cfg.ws_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        if (arg == "--ws-port" || arg == "--port") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for %s\n", arg.c_str());
+                exit(2);
+            }
+            std::string port_arg = argv[++i];
+            size_t consumed = 0;
+            unsigned long parsed = 0;
+            bool valid = false;
+            try {
+                parsed = std::stoul(port_arg, &consumed, 10);
+                valid = (consumed == port_arg.size() && parsed <= 65535UL);
+            } catch (...) {
+                valid = false;
+            }
+            if (!valid) {
+                fprintf(stderr, "Invalid %s value: %s (expected integer 0-65535)\n",
+                        arg.c_str(), port_arg.c_str());
+                exit(2);
+            }
+            cfg.ws_port = static_cast<uint16_t>(parsed);
+        }
         else if (arg == "--host" && i + 1 < argc)
             cfg.host = argv[++i];
         else if (arg == "--data-dir" && i + 1 < argc)
