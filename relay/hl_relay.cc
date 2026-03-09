@@ -426,20 +426,34 @@ struct Client : public std::enable_shared_from_this<Client> {
         kick_writer();
     }
 
+    // Cap coalesced WebSocket message size. Beast clients default to
+    // read_message_max = 16 MB; stay well under to avoid blowing up
+    // receivers and to keep latency bounded.
+    static constexpr size_t MAX_BATCH_BYTES = 4 * 1024 * 1024;  // 4 MB
+
     void kick_writer() {
         if (writing || write_queue.empty() || !active) return;
         writing = true;
 
-        // Coalesce: drain entire queue into one buffer, send as single
-        // WebSocket message. Clients parse by newline so this is transparent.
-        // One async_write per batch eliminates the event-loop round-trip
-        // that previously throttled throughput to one message per iteration.
+        // Coalesce queued messages into one buffer up to MAX_BATCH_BYTES.
+        // Clients parse by newline so batching is transparent.
         auto batch = std::make_shared<std::string>();
         size_t total = 0;
-        for (auto& m : write_queue) total += m->size();
+        for (auto& m : write_queue) {
+            if (total > 0 && total + m->size() > MAX_BATCH_BYTES)
+                break;
+            total += m->size();
+        }
         batch->reserve(total);
-        for (auto& m : write_queue) batch->append(*m);
-        write_queue.clear();
+        size_t consumed = 0;
+        while (!write_queue.empty()) {
+            auto& m = write_queue.front();
+            if (consumed > 0 && consumed + m->size() > MAX_BATCH_BYTES)
+                break;
+            consumed += m->size();
+            batch->append(*m);
+            write_queue.pop_front();
+        }
 
         auto self = shared_from_this();
         ws.async_write(
