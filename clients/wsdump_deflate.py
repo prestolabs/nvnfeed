@@ -277,11 +277,15 @@ async def main():
             opcode, payload = await read_frame()
             recv_ns = time.time_ns()
             if opcode == 0x1:  # text
-                text = payload.decode()
-                if tracker:
-                    _process_latency(text, recv_ns, tracker)
-                else:
-                    print(text, flush=True)
+                # The C++ relay may coalesce multiple messages into one
+                # WebSocket frame (newline-delimited). Process each line.
+                for line in payload.decode().splitlines():
+                    if not line:
+                        continue
+                    if tracker:
+                        _process_latency(line, recv_ns, tracker)
+                    else:
+                        print(line, flush=True)
             elif opcode == 0x8:  # close
                 print("Server closed connection", file=sys.stderr)
                 break
