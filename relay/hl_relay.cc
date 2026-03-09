@@ -429,12 +429,22 @@ struct Client : public std::enable_shared_from_this<Client> {
     void kick_writer() {
         if (writing || write_queue.empty() || !active) return;
         writing = true;
+
+        // Coalesce: drain entire queue into one buffer, send as single
+        // WebSocket message. Clients parse by newline so this is transparent.
+        // One async_write per batch eliminates the event-loop round-trip
+        // that previously throttled throughput to one message per iteration.
+        auto batch = std::make_shared<std::string>();
+        size_t total = 0;
+        for (auto& m : write_queue) total += m->size();
+        batch->reserve(total);
+        for (auto& m : write_queue) batch->append(*m);
+        write_queue.clear();
+
         auto self = shared_from_this();
-        auto& msg = write_queue.front();
         ws.async_write(
-            net::buffer(*msg),
-            [self](beast::error_code ec, std::size_t) {
-                self->write_queue.pop_front();
+            net::buffer(*batch),
+            [self, batch](beast::error_code ec, std::size_t) {
                 self->writing = false;
                 if (ec) {
                     if (ec != websocket::error::closed &&
@@ -443,6 +453,7 @@ struct Client : public std::enable_shared_from_this<Client> {
                     self->active = false;
                     return;
                 }
+                // Drain any messages that arrived while writing
                 self->kick_writer();
             });
     }
