@@ -326,50 +326,61 @@ async def ws_handshake(reader: asyncio.StreamReader,
 
 def filter_diffs_line(raw: str, coins: set[str]) -> str | None:
     """Filter a book-diffs JSON line to only include events for given coins.
+    Handles both batch-by-block (B) and line/single-event (L) formats.
     Returns filtered JSON string, or None if no matching events."""
-    # NOTE: current production clients subscribe to batch-by-block (B) format.
-    # This filter therefore expects a batch object with an "events" array.
-    # If line/single-event (L) subscriptions are introduced, this logic must
-    # be extended to handle that payload shape as well.
     # Quick reject: check if any coin name appears in the raw string
     if not any(f'"{c}"' in raw for c in coins):
         return None
-    batch = json.loads(raw)
-    events = batch.get("events", [])
-    filtered = [e for e in events if e.get("coin") in coins]
-    if not filtered:
-        return None
-    batch["events"] = filtered
-    return json.dumps(batch, separators=(",", ":"))
+    if '"block_number"' in raw:
+        # Batch-by-block format: {"block_number":..., "events":[...]}
+        batch = json.loads(raw)
+        events = batch.get("events", [])
+        filtered = [e for e in events if e.get("coin") in coins]
+        if not filtered:
+            return None
+        batch["events"] = filtered
+        return json.dumps(batch, separators=(",", ":"))
+    else:
+        # Line format: single event {"coin": "BTC", ...}
+        event = json.loads(raw)
+        if event.get("coin") not in coins:
+            return None
+        return raw
 
 
 def filter_fills_line(raw: str, coins: set[str]) -> str | None:
-    """Filter a fills JSON line to only include fill pairs for given coins.
-    Fill events come in pairs (buyer + seller); keep pairs together."""
-    # NOTE: current production clients subscribe to batch-by-block (B) format.
-    # This filter therefore expects a batch object with an "events" array.
-    # If line/single-event (L) subscriptions are introduced, this logic must
-    # be extended to handle that payload shape as well.
+    """Filter a fills JSON line to only include fill events for given coins.
+    Handles both batch-by-block (B) and line/single-event (L) formats.
+    In batch format, fill events come in pairs (buyer + seller); keep pairs together."""
     if not any(f'"{c}"' in raw for c in coins):
         return None
-    batch = json.loads(raw)
-    events = batch.get("events", [])
-    filtered = []
-    # Events are paired: [addr, fill_obj] at i, [addr, fill_obj] at i+1
-    i = 0
-    while i + 1 < len(events):
-        pair_a = events[i]
-        pair_b = events[i + 1]
-        # Each element is [address, fill_obj]
-        coin = pair_a[1].get("coin") if len(pair_a) >= 2 else None
-        if coin in coins:
-            filtered.append(pair_a)
-            filtered.append(pair_b)
-        i += 2
-    if not filtered:
-        return None
-    batch["events"] = filtered
-    return json.dumps(batch, separators=(",", ":"))
+    if '"block_number"' in raw:
+        # Batch-by-block format: events are [addr, fill_obj] pairs
+        batch = json.loads(raw)
+        events = batch.get("events", [])
+        filtered = []
+        # Events are paired: [addr, fill_obj] at i, [addr, fill_obj] at i+1
+        i = 0
+        while i + 1 < len(events):
+            pair_a = events[i]
+            pair_b = events[i + 1]
+            # Each element is [address, fill_obj]
+            coin = pair_a[1].get("coin") if len(pair_a) >= 2 else None
+            if coin in coins:
+                filtered.append(pair_a)
+                filtered.append(pair_b)
+            i += 2
+        if not filtered:
+            return None
+        batch["events"] = filtered
+        return json.dumps(batch, separators=(",", ":"))
+    else:
+        # Line format: single fill event [addr, fill_obj]
+        event = json.loads(raw)
+        coin = event[1].get("coin") if isinstance(event, list) and len(event) >= 2 else None
+        if coin not in coins:
+            return None
+        return raw
 
 # ── Channel subscription ──────────────────────────────────────────────────────
 
