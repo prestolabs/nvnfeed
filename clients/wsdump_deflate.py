@@ -94,10 +94,12 @@ class LatencyTracker:
             self._last_report = now
 
     def record_net(self, relay_ns: int, recv_ns: int, channel: str, seq: int,
-                   e2e_ms: float | None = None):
+                   block_time_ns: int | None = None):
         """Record latency for line-format messages.
-        e2e_ms is provided for fills (from event time field); None for book diffs."""
+        block_time_ns: event time in ns (fills only); None for book diffs."""
         net_ms = (recv_ns - relay_ns) / 1e6
+        e2e_ms = (recv_ns - block_time_ns) / 1e6 if block_time_ns is not None else None
+
         self.lnet.append(net_ms)
         self.all_lnet.append(net_ms)
         if e2e_ms is not None:
@@ -389,15 +391,14 @@ def _process_latency(text: str, recv_ns: int, tracker: LatencyTracker):
     elif fmt == "L":
         # Line format: fills have a "time" field (epoch ms) → compute e2e.
         # Book diffs have no timestamp → net only.
-        e2e_ms = None
+        block_time_ns = None
         if channel.startswith("F"):
             try:
                 event = json.loads(json_str)
-                time_ms = event[1]["time"]  # [addr, fill_obj]
-                e2e_ms = (recv_ns - time_ms * 1_000_000) / 1e6
+                block_time_ns = event[1]["time"] * 1_000_000  # ms → ns
             except (json.JSONDecodeError, KeyError, IndexError, TypeError):
                 pass
-        tracker.record_net(relay_ns, recv_ns, channel, seq, e2e_ms)
+        tracker.record_net(relay_ns, recv_ns, channel, seq, block_time_ns)
         return
 
     # Fallback: can't extract timestamps, just print
