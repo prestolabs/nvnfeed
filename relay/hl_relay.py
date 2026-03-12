@@ -778,7 +778,7 @@ class InotifyWatcher:
             self.book_base = os.path.join(data_dir, "node_raw_book_diffs")
             self.fills_base = os.path.join(data_dir, "node_fills")
         else:
-            self.book_base = os.path.join(data_dir, "node_raw_book_diffs_by_block")
+            self.book_base = os.path.join(data_dir, "o")
             self.fills_base = os.path.join(data_dir, "node_fills_by_block")
 
         self.ifd = libc.inotify_init()

@@ -48,16 +48,21 @@ class LatencyTracker:
 
     def __init__(self, interval: float = 10.0):
         self.interval = interval
-        # Window (reset each interval)
+        # Window (reset each interval) — batch format (B)
         self.node: list[float] = []
         self.relay: list[float] = []
         self.network: list[float] = []
         self.e2e: list[float] = []
-        # Accumulated (never reset)
+        # Accumulated (never reset) — batch format (B)
         self.all_node: list[float] = []
         self.all_relay: list[float] = []
         self.all_network: list[float] = []
         self.all_e2e: list[float] = []
+        # Window/accumulated — line format (L)
+        self.lnet: list[float] = []
+        self.all_lnet: list[float] = []
+        self.le2e: list[float] = []
+        self.all_le2e: list[float] = []
         self._last_report = time.monotonic()
         self._start = time.monotonic()
 
@@ -81,6 +86,28 @@ class LatencyTracker:
         print(f"[{channel}] blk={block_num} "
               f"e2e={e2e_ms:7.1f}ms  node={node_ms:7.1f}ms  "
               f"relay={relay_ms:5.1f}ms  net={net_ms:7.1f}ms",
+              flush=True)
+
+        now = time.monotonic()
+        if now - self._last_report >= self.interval:
+            self._print_stats()
+            self._last_report = now
+
+    def record_net(self, relay_ns: int, recv_ns: int, channel: str, seq: int,
+                   e2e_ms: float | None = None):
+        """Record latency for line-format messages.
+        e2e_ms is provided for fills (from event time field); None for book diffs."""
+        net_ms = (recv_ns - relay_ns) / 1e6
+        self.lnet.append(net_ms)
+        self.all_lnet.append(net_ms)
+        if e2e_ms is not None:
+            self.le2e.append(e2e_ms)
+            self.all_le2e.append(e2e_ms)
+
+        e2e_str = f"{e2e_ms:7.1f}" if e2e_ms is not None else "    N/A"
+        print(f"[{channel}] blk={seq} "
+              f"e2e={e2e_str}ms  node=    N/Ams  "
+              f"relay=  N/Ams  net={net_ms:7.1f}ms",
               flush=True)
 
         now = time.monotonic()
@@ -112,7 +139,9 @@ class LatencyTracker:
     def _print_stats(self):
         n = len(self.e2e)
         n_all = len(self.all_e2e)
-        if n == 0 and n_all == 0:
+        nl = len(self.lnet)
+        nl_all = len(self.all_lnet)
+        if n == 0 and n_all == 0 and nl == 0 and nl_all == 0:
             return
         elapsed = time.monotonic() - self._start
         print(f"\n--- Latency stats ---", file=sys.stderr)
@@ -129,12 +158,28 @@ class LatencyTracker:
                 [("e2e", self.all_e2e), ("node", self.all_node),
                  ("relay", self.all_relay), ("network", self.all_network)])
 
+        if nl > 0:
+            datasets = []
+            if self.le2e:
+                datasets.append(("e2e", self.le2e))
+            datasets.append(("network", self.lnet))
+            self._print_section(f"Line-fmt last {self.interval:.0f}s ({nl} msgs):", datasets)
+
+        if nl_all > 0:
+            datasets = []
+            if self.all_le2e:
+                datasets.append(("e2e", self.all_le2e))
+            datasets.append(("network", self.all_lnet))
+            self._print_section(f"Line-fmt accumulated ({nl_all} msgs, {elapsed:.0f}s):", datasets)
+
         print(file=sys.stderr, flush=True)
         # Reset window
         self.node.clear()
         self.relay.clear()
         self.network.clear()
         self.e2e.clear()
+        self.lnet.clear()
+        self.le2e.clear()
 
 
 async def main():
@@ -317,14 +362,17 @@ def _process_latency(text: str, recv_ns: int, tracker: LatencyTracker):
             print(text, flush=True)
             return
         channel = parts[0]
+        seq = int(parts[1])
         relay_ns = int(parts[2])
         json_str = parts[3]
     except (ValueError, IndexError):
         print(text, flush=True)
         return
 
-    # Parse JSON for block_time and local_time (batch format only)
-    if channel.endswith("B"):
+    fmt = channel[-1] if channel else ""
+
+    if fmt == "B":
+        # Batch format: JSON has block_time, local_time, block_number
         try:
             data = json.loads(json_str)
             block_time_iso = data.get("block_time")
@@ -338,6 +386,19 @@ def _process_latency(text: str, recv_ns: int, tracker: LatencyTracker):
                 return
         except (json.JSONDecodeError, KeyError, ValueError):
             pass
+    elif fmt == "L":
+        # Line format: fills have a "time" field (epoch ms) → compute e2e.
+        # Book diffs have no timestamp → net only.
+        e2e_ms = None
+        if channel.startswith("F"):
+            try:
+                event = json.loads(json_str)
+                time_ms = event[1]["time"]  # [addr, fill_obj]
+                e2e_ms = (recv_ns - time_ms * 1_000_000) / 1e6
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                pass
+        tracker.record_net(relay_ns, recv_ns, channel, seq, e2e_ms)
+        return
 
     # Fallback: can't extract timestamps, just print
     print(text, flush=True)
