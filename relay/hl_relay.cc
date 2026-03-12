@@ -229,7 +229,22 @@ static bool contains_any_quoted_coin(const std::string& raw,
     return false;
 }
 
-// Filter a book-diffs batch JSON to only include events for given coins.
+// Build coin patterns for substring matching (both compact and spaced forms).
+static std::vector<std::pair<std::string, size_t>>
+build_coin_patterns(const std::unordered_set<std::string>& coins) {
+    std::vector<std::pair<std::string, size_t>> patterns;
+    patterns.reserve(coins.size() * 2);
+    for (auto& c : coins) {
+        std::string p1 = "\"coin\":\"" + c + "\"";
+        std::string p2 = "\"coin\": \"" + c + "\"";
+        patterns.push_back({p1, p1.size()});
+        patterns.push_back({p2, p2.size()});
+    }
+    return patterns;
+}
+
+// Filter a book-diffs JSON line to only include events for given coins.
+// Handles both batch-by-block (B) and line/single-event (L) formats.
 // Uses raw string splicing — no DOM parse, no re-serialize.
 static std::string filter_diffs_line(const std::string& raw,
                                      const std::unordered_set<std::string>& coins) {
@@ -239,7 +254,14 @@ static std::string filter_diffs_line(const std::string& raw,
     // Fast string pre-check
     if (!contains_any_quoted_coin(raw, coins)) return {};
 
-    // Find "events" key and its array value, handling optional whitespace
+    auto patterns = build_coin_patterns(coins);
+
+    // Line format: single event {"coin":"BTC",...} — no block wrapper
+    if (raw.find("\"block_number\"") == std::string::npos) {
+        return coin_matches(data, 0, len, patterns) ? raw : std::string{};
+    }
+
+    // Batch-by-block format: find "events" array and splice matching events
     const char* ekey = "\"events\"";
     const char* found = strstr(data, ekey);
     if (!found) return {};
@@ -250,17 +272,6 @@ static std::string filter_diffs_line(const std::string& raw,
     if (pos_after_key >= len || data[pos_after_key] != '[') return {};
     size_t arr_start = pos_after_key; // points at '['
 
-    // Build coin patterns (both compact and spaced forms)
-    std::vector<std::pair<std::string, size_t>> patterns;
-    patterns.reserve(coins.size() * 2);
-    for (auto& c : coins) {
-        std::string p1 = "\"coin\":\"" + c + "\"";
-        std::string p2 = "\"coin\": \"" + c + "\"";
-        patterns.push_back({p1, p1.size()});
-        patterns.push_back({p2, p2.size()});
-    }
-
-    // Scan events, splice matching ones
     std::string result;
     result.reserve(raw.size());
     result.append(data, arr_start + 1); // everything up to and including '['
@@ -296,8 +307,9 @@ static std::string filter_diffs_line(const std::string& raw,
     return result;
 }
 
-// Filter a fills batch JSON. Fill events come in pairs; check coin in
-// the first element of each pair and keep both elements together.
+// Filter a fills JSON line. In batch format fill events come in pairs;
+// check coin in the first element and keep both together.
+// Handles both batch-by-block (B) and line/single-event (L) formats.
 static std::string filter_fills_line(const std::string& raw,
                                      const std::unordered_set<std::string>& coins) {
     const char* data = raw.data();
@@ -305,7 +317,14 @@ static std::string filter_fills_line(const std::string& raw,
 
     if (!contains_any_quoted_coin(raw, coins)) return {};
 
-    // Find "events" key and its array value, handling optional whitespace
+    auto patterns = build_coin_patterns(coins);
+
+    // Line format: single fill event ["addr", fill_obj] — no block wrapper
+    if (raw.find("\"block_number\"") == std::string::npos) {
+        return coin_matches(data, 0, len, patterns) ? raw : std::string{};
+    }
+
+    // Batch-by-block format: find "events" array, process pairs
     const char* ekey = "\"events\"";
     const char* found = strstr(data, ekey);
     if (!found) return {};
@@ -314,16 +333,6 @@ static std::string filter_fills_line(const std::string& raw,
            data[pos_after_key] == ':' || data[pos_after_key] == '\t')) ++pos_after_key;
     if (pos_after_key >= len || data[pos_after_key] != '[') return {};
     size_t arr_start = pos_after_key; // points at '['
-
-    // Build coin patterns (both compact and spaced forms)
-    std::vector<std::pair<std::string, size_t>> patterns;
-    patterns.reserve(coins.size() * 2);
-    for (auto& c : coins) {
-        std::string p1 = "\"coin\":\"" + c + "\"";
-        std::string p2 = "\"coin\": \"" + c + "\"";
-        patterns.push_back({p1, p1.size()});
-        patterns.push_back({p2, p2.size()});
-    }
 
     std::string result;
     result.reserve(raw.size());
@@ -585,12 +594,12 @@ private:
 class InotifyWatcher {
 public:
     InotifyWatcher(net::io_context& ioc, Dispatcher& dispatcher,
-                   const std::string& data_dir)
+                   const std::string& data_dir, bool line_format = false)
         : ioc_(ioc)
         , dispatcher_(dispatcher)
         , data_dir_(data_dir)
-        , book_base_(data_dir + "/node_raw_book_diffs_by_block")
-        , fills_base_(data_dir + "/node_fills_by_block")
+        , book_base_(data_dir + (line_format ? "/node_raw_book_diffs" : "/node_raw_book_diffs_by_block"))
+        , fills_base_(data_dir + (line_format ? "/node_fills" : "/node_fills_by_block"))
         , rotation_timer_(ioc)
         , inotify_sd_(ioc)
     {
@@ -1152,6 +1161,7 @@ struct Config {
     uint16_t ws_port = 8766;
     std::string data_dir;
     bool verbose = false;
+    bool line_format = false;
 
     Config() {
         const char* home = getenv("HOME");
@@ -1191,12 +1201,15 @@ static Config parse_args(int argc, char* argv[]) {
             cfg.data_dir = argv[++i];
         else if (arg == "--verbose" || arg == "-v")
             cfg.verbose = true;
+        else if (arg == "--line-format" || arg == "-l")
+            cfg.line_format = true;
         else if (arg == "--help" || arg == "-h") {
             fprintf(stderr,
                 "Usage: %s [options]\n"
                 "  --ws-port PORT    WebSocket listen port (default: 8766)\n"
                 "  --host ADDR       Bind address (default: 0.0.0.0)\n"
                 "  --data-dir PATH   Node data directory (default: ~/hl/data)\n"
+                "  --line-format,-l  Use line/single-event format (node_raw_book_diffs, node_fills)\n"
                 "  --verbose, -v     Enable debug logging\n",
                 argv[0]);
             exit(0);
@@ -1216,7 +1229,8 @@ int main(int argc, char* argv[]) {
     // Ignore SIGPIPE
     signal(SIGPIPE, SIG_IGN);
 
-    LOG_I("Starting hl_relay (C++): ws-port=%d data_dir=%s", cfg.ws_port, cfg.data_dir.c_str());
+    LOG_I("Starting hl_relay (C++): ws-port=%d data_dir=%s format=%s",
+          cfg.ws_port, cfg.data_dir.c_str(), cfg.line_format ? "line" : "batch-by-block");
 
     // Verify data directory exists
     struct stat st;
@@ -1242,7 +1256,7 @@ int main(int argc, char* argv[]) {
     listener->run();
 
     // Set up inotify watcher
-    InotifyWatcher watcher(ioc, dispatcher, cfg.data_dir);
+    InotifyWatcher watcher(ioc, dispatcher, cfg.data_dir, cfg.line_format);
     watcher.start();
 
     // Signal handling
