@@ -34,8 +34,9 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Set
+from pathlib import Path
 
-DATA_ROOT = "/home/ubuntu/hl/data"
+DATA_ROOT = Path("~/hl/data").expanduser()
 
 HOURLY_SOURCES = [
     "crit_msg_stats",
@@ -44,12 +45,15 @@ HOURLY_SOURCES = [
     "latency_summaries",
     "node_fast_block_times",
     "node_fills_by_block",
+    "node_fills"
     "node_logs",
     "node_order_statuses_by_block",
     "node_raw_book_diffs_by_block",
+    "node_raw_book_diffs",
     "node_slow_block_times",
     "node_trades_by_block",
     "node_twap_statuses_by_block",
+    "node_twap_statuses",
     "rate_limited_ips",
     "tcp_lz4_stats",
     "tcp_traffic",

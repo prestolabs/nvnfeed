@@ -770,12 +770,16 @@ async def handle_ws_client(reader: asyncio.StreamReader,
 class InotifyWatcher:
     """Watches data directories via inotify, integrated with asyncio event loop."""
 
-    def __init__(self, data_dir: str, dispatcher: Dispatcher):
+    def __init__(self, data_dir: str, dispatcher: Dispatcher, is_line_format: bool = False):
         self.data_dir = data_dir
         self.dispatcher = dispatcher
 
-        self.book_base = os.path.join(data_dir, "node_raw_book_diffs_by_block")
-        self.fills_base = os.path.join(data_dir, "node_fills_by_block")
+        if is_line_format:
+            self.book_base = os.path.join(data_dir, "node_raw_book_diffs")
+            self.fills_base = os.path.join(data_dir, "node_fills")
+        else:
+            self.book_base = os.path.join(data_dir, "node_raw_book_diffs_by_block")
+            self.fills_base = os.path.join(data_dir, "node_fills_by_block")
 
         self.ifd = libc.inotify_init()
         if self.ifd < 0:
@@ -935,7 +939,7 @@ class InotifyWatcher:
 
 async def async_main(args):
     dispatcher = Dispatcher()
-    watcher = InotifyWatcher(args.data_dir, dispatcher)
+    watcher = InotifyWatcher(args.data_dir, dispatcher, args.line_format)
     watcher.setup_watches()
 
     loop = asyncio.get_running_loop()
@@ -996,6 +1000,8 @@ def main():
                         help="Node data directory (default: ~/hl/data)")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Enable debug logging")
+    parser.add_argument("--line-format", "-l", action="store_true",
+                        help="Enable line/single-event format")
     args = parser.parse_args()
 
     logging.basicConfig(
