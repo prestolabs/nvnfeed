@@ -94,21 +94,19 @@ class LatencyTracker:
             self._last_report = now
 
     def record_net(self, relay_ns: int, recv_ns: int, channel: str, seq: int,
-                   block_time_ns: int | None = None):
+                   block_time_ns: int):
         """Record latency for line-format messages.
-        block_time_ns: event time in ns (fills only); None for book diffs."""
+        block_time_ns: fill event time in ns (FL); relay_ns for book diffs (DL, no timestamp)."""
         net_ms = (recv_ns - relay_ns) / 1e6
-        e2e_ms = (recv_ns - block_time_ns) / 1e6 if block_time_ns is not None else None
+        e2e_ms = (recv_ns - block_time_ns) / 1e6
 
         self.lnet.append(net_ms)
         self.all_lnet.append(net_ms)
-        if e2e_ms is not None:
-            self.le2e.append(e2e_ms)
-            self.all_le2e.append(e2e_ms)
+        self.le2e.append(e2e_ms)
+        self.all_le2e.append(e2e_ms)
 
-        e2e_str = f"{e2e_ms:7.1f}" if e2e_ms is not None else "    N/A"
         print(f"[{channel}] blk={seq} "
-              f"e2e={e2e_str}ms  node=    N/Ams  "
+              f"e2e={e2e_ms:7.1f}ms  node=    N/Ams  "
               f"relay=  N/Ams  net={net_ms:7.1f}ms",
               flush=True)
 
@@ -161,18 +159,14 @@ class LatencyTracker:
                  ("relay", self.all_relay), ("network", self.all_network)])
 
         if nl > 0:
-            datasets = []
-            if self.le2e:
-                datasets.append(("e2e", self.le2e))
-            datasets.append(("network", self.lnet))
-            self._print_section(f"Line-fmt last {self.interval:.0f}s ({nl} msgs):", datasets)
+            self._print_section(
+                f"Line-fmt last {self.interval:.0f}s ({nl} msgs):",
+                [("e2e", self.le2e), ("network", self.lnet)])
 
         if nl_all > 0:
-            datasets = []
-            if self.all_le2e:
-                datasets.append(("e2e", self.all_le2e))
-            datasets.append(("network", self.all_lnet))
-            self._print_section(f"Line-fmt accumulated ({nl_all} msgs, {elapsed:.0f}s):", datasets)
+            self._print_section(
+                f"Line-fmt accumulated ({nl_all} msgs, {elapsed:.0f}s):",
+                [("e2e", self.all_le2e), ("network", self.all_lnet)])
 
         print(file=sys.stderr, flush=True)
         # Reset window
@@ -391,7 +385,7 @@ def _process_latency(text: str, recv_ns: int, tracker: LatencyTracker):
     elif fmt == "L":
         # Line format: fills have a "time" field (epoch ms) → compute e2e.
         # Book diffs have no timestamp → net only.
-        block_time_ns = None
+        block_time_ns = relay_ns
         if channel.startswith("F"):
             try:
                 event = json.loads(json_str)
