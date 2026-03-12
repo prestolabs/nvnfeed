@@ -36,7 +36,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Set
 from pathlib import Path
 
-DATA_ROOT = Path("~/hl/data").expanduser()
+DATA_ROOT = str(Path("~/hl/data").expanduser())
 
 HOURLY_SOURCES = [
     "crit_msg_stats",
