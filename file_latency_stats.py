@@ -138,15 +138,21 @@ def main():
         default=os.path.expanduser("~/hl/data"),
         help="Node data directory",
     )
+    parser.add_argument("--line-format", action="store_true",
+                        help="Parse line-format latency")
     args = parser.parse_args()
 
     coins = set(args.coins.split(","))
     print(f"Tracking coins: {coins}")
     print(f"Duration: {args.duration}s")
     print()
-
-    book_diffs_base = os.path.join(args.data_dir, "node_raw_book_diffs_by_block")
-    fills_base = os.path.join(args.data_dir, "node_fills_by_block")
+    
+    if args.line_format:
+        book_diffs_base = os.path.join(args.data_dir, "node_raw_book_diffs")
+        fills_base = os.path.join(args.data_dir, "node_fills")
+    else:
+        book_diffs_base = os.path.join(args.data_dir, "node_raw_book_diffs_by_block")
+        fills_base = os.path.join(args.data_dir, "node_fills_by_block")
 
     # Set up inotify
     ifd = libc.inotify_init()
