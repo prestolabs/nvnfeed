@@ -472,6 +472,24 @@ struct Client : public std::enable_shared_from_this<Client> {
             });
     }
 
+    void ping_if_idle() {
+        if (!active || writing) return;
+        writing = true;
+        auto self = shared_from_this();
+        ws.async_ping({},
+            [self](beast::error_code ec) {
+                self->writing = false;
+                if (ec) {
+                    if (ec != websocket::error::closed &&
+                        ec != net::error::operation_aborted)
+                        LOG_D("Ping error for %s: %s", self->addr.c_str(), ec.message().c_str());
+                    self->active = false;
+                    return;
+                }
+                self->kick_writer();
+            });
+    }
+
     void do_close() {
         beast::error_code ec;
         ws.async_close(websocket::close_code::going_away,
@@ -487,6 +505,14 @@ class Dispatcher {
 public:
     uint64_t seq = 0;
     std::vector<std::shared_ptr<Client>> clients;
+
+    static constexpr int PING_INTERVAL_SECONDS = 5;
+
+    explicit Dispatcher(net::io_context& ioc)
+        : ping_timer_(ioc)
+    {
+        start_ping_timer();
+    }
 
     uint64_t next_seq() { return ++seq; }
 
@@ -573,7 +599,23 @@ public:
             clients.end());
     }
 
+    void stop() {
+        ping_timer_.cancel();
+    }
+
 private:
+    net::steady_timer ping_timer_;
+
+    void start_ping_timer() {
+        ping_timer_.expires_after(std::chrono::seconds(PING_INTERVAL_SECONDS));
+        ping_timer_.async_wait([this](beast::error_code ec) {
+            if (ec) return;
+            for (auto& client : clients)
+                client->ping_if_idle();
+            start_ping_timer();
+        });
+    }
+
     // Per-dispatch dedup cache: coin_key -> filtered message (or nullptr if no match)
     std::unordered_map<std::string, std::shared_ptr<const std::string>> filter_cache_;
 };
@@ -750,13 +792,52 @@ private:
         }
     }
 
+    static constexpr size_t DISPATCH_BATCH_MAX_LINES = 256;
+    static constexpr size_t DISPATCH_BATCH_MAX_BYTES = 16 * 1024 * 1024;  // 16 MB
+
+    // Per-channel pending queue and in-flight flag to preserve ordering
+    struct ChannelQueue {
+        std::deque<std::string> pending;
+        bool dispatching = false;  // true while a posted continuation exists
+    };
+    std::unordered_map<char, ChannelQueue> channel_queues_;
+
     void read_and_dispatch(const std::string& src_type) {
         auto it = tailers_.find(src_type);
         if (it == tailers_.end()) return;
         char channel = (src_type == "book") ? 'D' : 'F';
         auto lines = it->second.read_new_lines();
+        if (lines.empty()) return;
+
+        auto& q = channel_queues_[channel];
         for (auto& line : lines)
-            dispatcher_.dispatch(channel, line);
+            q.pending.push_back(std::move(line));
+
+        if (!q.dispatching)
+            dispatch_batch(channel);
+    }
+
+    void dispatch_batch(char channel) {
+        auto& q = channel_queues_[channel];
+        size_t batch_bytes = 0;
+        size_t count = 0;
+        while (!q.pending.empty()) {
+            if (count >= DISPATCH_BATCH_MAX_LINES) break;
+            batch_bytes += q.pending.front().size();
+            if (count > 0 && batch_bytes >= DISPATCH_BATCH_MAX_BYTES) break;
+            dispatcher_.dispatch(channel, q.pending.front());
+            q.pending.pop_front();
+            ++count;
+        }
+
+        if (!q.pending.empty()) {
+            q.dispatching = true;
+            net::post(ioc_, [this, channel]() {
+                dispatch_batch(channel);
+            });
+        } else {
+            q.dispatching = false;
+        }
     }
 
     void start_rotation_timer() {
@@ -1226,7 +1307,7 @@ int main(int argc, char* argv[]) {
 
     net::io_context ioc{1};  // single-threaded
 
-    Dispatcher dispatcher;
+    Dispatcher dispatcher(ioc);
 
     // Set up WebSocket listener — fatal if port is unavailable
     std::shared_ptr<WsListener> listener;
@@ -1251,6 +1332,7 @@ int main(int argc, char* argv[]) {
         LOG_I("Received signal %d, shutting down", sig);
         listener->stop();
         watcher.stop();
+        dispatcher.stop();
         // Close all client connections
         for (auto& client : dispatcher.clients) {
             client->active = false;
