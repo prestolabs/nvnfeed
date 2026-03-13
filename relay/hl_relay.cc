@@ -71,6 +71,12 @@ static void setup_logger(bool verbose, const std::string& log_file) {
     sinks.push_back(stderr_sink);
 
     if (!log_file.empty()) {
+        // Ensure parent directory exists
+        auto slash = log_file.rfind('/');
+        if (slash != std::string::npos) {
+            std::string dir = log_file.substr(0, slash);
+            mkdir(dir.c_str(), 0755);
+        }
         auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(log_file, /*truncate=*/false);
         file_sink->set_pattern("[%Y-%m-%dT%H:%M:%S.%e] [%l] %v");
         sinks.push_back(file_sink);
@@ -1180,7 +1186,9 @@ struct Config {
 
     Config() {
         const char* home = getenv("HOME");
-        data_dir = std::string(home ? home : "/root") + "/hl/data";
+        std::string home_str(home ? home : "/root");
+        data_dir = home_str + "/hl/data";
+        log_file = home_str + "/logs/hl_relay.log";
     }
 };
 
