@@ -448,7 +448,7 @@ struct Client : public std::enable_shared_from_this<Client> {
     // Cap coalesced WebSocket message size. Beast clients default to
     // read_message_max = 16 MB; stay well under to avoid blowing up
     // receivers and to keep latency bounded.
-    static constexpr size_t MAX_BATCH_BYTES = 1 * 1024 * 1024;  // 4 MB
+    static constexpr size_t MAX_BATCH_BYTES = 128 * 1024;  // 4 MB
 
     void kick_writer() {
         if (writing || write_queue.empty() || !active) return;
