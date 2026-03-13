@@ -458,13 +458,23 @@ struct Client : public std::enable_shared_from_this<Client> {
         kick_writer();
     }
 
+    static constexpr size_t MAX_BATCH_BYTES = 4 * 1024 * 1024;
+
     void kick_writer() {
         if (writing || write_queue.empty() || !active) return;
         writing = true;
 
-        // Send one message at a time to minimise queuing delay.
-        auto batch = write_queue.front();
-        write_queue.pop_front();
+        // Coalesce queued messages into one write. Multiple messages arriving
+        // within one async_write round-trip are sent as a single compressed
+        // WebSocket frame, sharing a deflate context for better compression.
+        auto batch = std::make_shared<std::string>();
+        while (!write_queue.empty()) {
+            auto& m = write_queue.front();
+            if (!batch->empty() && batch->size() + m->size() > MAX_BATCH_BYTES)
+                break;
+            batch->append(*m);
+            write_queue.pop_front();
+        }
 
 
         auto self = shared_from_this();
@@ -863,14 +873,13 @@ public:
         else
             client_->addr = "unknown";
 
-        // Enable permessage-deflate — large book diff messages compress ~80-90%,
-        // reducing transmission time and net latency significantly.
-        // server_no_context_takeover: each message is compressed independently,
-        // so clients can use a fresh decompressor per frame.
+        // Enable permessage-deflate with context takeover: the server keeps a
+        // shared deflate window across messages, so consecutive book diff blocks
+        // (which share many repeated price levels and coin names) compress much
+        // better than per-message compression.
         websocket::permessage_deflate pmd;
         pmd.server_enable = true;
         pmd.client_enable = true;
-        pmd.server_no_context_takeover = true;
         client_->ws.set_option(pmd);
 
         // Set auto-fragment off for lower latency
