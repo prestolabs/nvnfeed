@@ -21,7 +21,7 @@
 
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/ansicolor_sink.h>
-#include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/daily_file_sink.h>
 
 #include <algorithm>
 #include <chrono>
@@ -77,7 +77,10 @@ static void setup_logger(bool verbose, const std::string& log_file) {
             std::string dir = log_file.substr(0, slash);
             mkdir(dir.c_str(), 0755);
         }
-        auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(log_file, /*truncate=*/false);
+        // Rotate daily at midnight, keep 7 days
+        auto file_sink = std::make_shared<spdlog::sinks::daily_file_sink_mt>(
+            log_file, /*rotation_hour=*/0, /*rotation_minute=*/0,
+            /*truncate=*/false, /*max_files=*/7);
         file_sink->set_pattern("[%Y-%m-%dT%H:%M:%S.%e] [%l] %v");
         sinks.push_back(file_sink);
     }
