@@ -269,12 +269,7 @@ static std::string filter_diffs_line(const std::string& raw,
     const char* data = raw.data();
     const size_t len = raw.size();
 
-    // Fast string pre-check
-    if (!contains_any_quoted_coin(raw, quoted_coins)) return {};
-
-    // auto patterns = build_coin_patterns(coins);
-
-    // // Line format: single event {"coin":"BTC",...} — no block wrapper
+    // Line format: single event {"coin":"BTC",...} — no block wrapper
     if (raw.find("\"block_number\"") == std::string::npos) {
         return coin_matches(data, 0, len, patterns) ? raw : std::string{};
     }
@@ -333,10 +328,6 @@ static std::string filter_fills_line(const std::string& raw,
                                      const std::vector<std::string>& quoted_coins) {
     const char* data = raw.data();
     const size_t len = raw.size();
-
-    if (!contains_any_quoted_coin(raw, quoted_coins)) return {};
-
-    // auto patterns = build_coin_patterns(coins);
 
     // Line format: single fill event ["addr", fill_obj] — no block wrapper
     if (raw.find("\"block_number\"") == std::string::npos) {
@@ -557,6 +548,10 @@ public:
                 // Zero-copy: share the same string
                 client->enqueue(unfiltered);
             } else {
+                // Fast pre-check using quoted coins built at subscribe time.
+                // Skip cache lookup and full filter if no coin appears in the line.
+                if (!contains_any_quoted_coin(raw_line, client->quoted_coins)) continue;
+
                 // Check dedup cache first
                 auto cache_it = filter_cache_.find(client->coin_key);
                 if (cache_it != filter_cache_.end()) {
