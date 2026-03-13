@@ -3,7 +3,7 @@
 // Tails hl-node data files via inotify, streams raw JSON lines to WebSocket
 // clients. Supports per-coin filtering and channel selection.
 //
-// Build: g++ -std=c++17 -O2 -o relay/hl_relay relay/hl_relay.cc -lpthread
+// Build: see relay/build.sh  (requires spdlog headers in relay/spdlog/)
 // Usage: ./relay/hl_relay --ws-port 8766 --data-dir ~/hl/data
 
 #include <rapidjson/document.h>
@@ -19,8 +19,13 @@
 #include <unistd.h>
 #include <signal.h>
 
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/ansicolor_sink.h>
+#include <spdlog/sinks/basic_file_sink.h>
+
 #include <algorithm>
 #include <chrono>
+#include <cstdarg>
 #include <cstring>
 #include <ctime>
 #include <deque>
@@ -38,35 +43,50 @@ namespace http = beast::http;
 using tcp = net::ip::tcp;
 
 // ============================================================================
-// Logging
+// Logging — printf-style wrappers over spdlog
 // ============================================================================
 
-enum LogLevel { LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR };
-static LogLevel g_log_level = LOG_INFO;
-
-static void log_msg(LogLevel level, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
-static void log_msg(LogLevel level, const char* fmt, ...) {
-    if (level < g_log_level) return;
-    static const char* level_names[] = {"DEBUG", "INFO", "WARN", "ERROR"};
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    struct tm tm;
-    gmtime_r(&ts.tv_sec, &tm);
-    char tbuf[32];
-    snprintf(tbuf, sizeof(tbuf), "%02d:%02d:%02d.%03ld",
-             tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000);
-    fprintf(stderr, "%s %-5s hl_relay: ", tbuf, level_names[level]);
+// Forward declaration so LOG_* macros work before setup_logger() is called.
+static void log_msg(spdlog::level::level_enum level, const char* fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+static void log_msg(spdlog::level::level_enum level, const char* fmt, ...) {
+    char buf[2048];
     va_list args;
     va_start(args, fmt);
-    vfprintf(stderr, fmt, args);
+    vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    fprintf(stderr, "\n");
+    spdlog::log(level, buf);
 }
 
-#define LOG_D(...) log_msg(LOG_DEBUG, __VA_ARGS__)
-#define LOG_I(...) log_msg(LOG_INFO, __VA_ARGS__)
-#define LOG_W(...) log_msg(LOG_WARN, __VA_ARGS__)
-#define LOG_E(...) log_msg(LOG_ERROR, __VA_ARGS__)
+#define LOG_D(...) log_msg(spdlog::level::debug, __VA_ARGS__)
+#define LOG_I(...) log_msg(spdlog::level::info,  __VA_ARGS__)
+#define LOG_W(...) log_msg(spdlog::level::warn,  __VA_ARGS__)
+#define LOG_E(...) log_msg(spdlog::level::err,   __VA_ARGS__)
+
+static void setup_logger(bool verbose, const std::string& log_file) {
+    std::vector<spdlog::sink_ptr> sinks;
+
+    auto stderr_sink = std::make_shared<spdlog::sinks::ansicolor_stderr_sink_mt>();
+    stderr_sink->set_pattern("[%Y-%m-%dT%H:%M:%S.%e] [%^%l%$] %v");
+    sinks.push_back(stderr_sink);
+
+    if (!log_file.empty()) {
+        // Ensure parent directory exists
+        auto slash = log_file.rfind('/');
+        if (slash != std::string::npos) {
+            std::string dir = log_file.substr(0, slash);
+            mkdir(dir.c_str(), 0755);
+        }
+        auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(log_file, /*truncate=*/false);
+        file_sink->set_pattern("[%Y-%m-%dT%H:%M:%S.%e] [%l] %v");
+        sinks.push_back(file_sink);
+    }
+
+    auto logger = std::make_shared<spdlog::logger>("hl_relay", sinks.begin(), sinks.end());
+    logger->set_level(verbose ? spdlog::level::debug : spdlog::level::info);
+    logger->flush_on(spdlog::level::warn);
+    spdlog::set_default_logger(logger);
+}
 
 // ============================================================================
 // FileTailer — POSIX I/O based file tailing
@@ -229,7 +249,22 @@ static bool contains_any_quoted_coin(const std::string& raw,
     return false;
 }
 
-// Filter a book-diffs batch JSON to only include events for given coins.
+// Build coin patterns for substring matching (both compact and spaced forms).
+static std::vector<std::pair<std::string, size_t>>
+build_coin_patterns(const std::unordered_set<std::string>& coins) {
+    std::vector<std::pair<std::string, size_t>> patterns;
+    patterns.reserve(coins.size() * 2);
+    for (auto& c : coins) {
+        std::string p1 = "\"coin\":\"" + c + "\"";
+        std::string p2 = "\"coin\": \"" + c + "\"";
+        patterns.push_back({p1, p1.size()});
+        patterns.push_back({p2, p2.size()});
+    }
+    return patterns;
+}
+
+// Filter a book-diffs JSON line to only include events for given coins.
+// Handles both batch-by-block (B) and line/single-event (L) formats.
 // Uses raw string splicing — no DOM parse, no re-serialize.
 static std::string filter_diffs_line(const std::string& raw,
                                      const std::unordered_set<std::string>& coins) {
@@ -239,7 +274,14 @@ static std::string filter_diffs_line(const std::string& raw,
     // Fast string pre-check
     if (!contains_any_quoted_coin(raw, coins)) return {};
 
-    // Find "events" key and its array value, handling optional whitespace
+    auto patterns = build_coin_patterns(coins);
+
+    // Line format: single event {"coin":"BTC",...} — no block wrapper
+    if (raw.find("\"block_number\"") == std::string::npos) {
+        return coin_matches(data, 0, len, patterns) ? raw : std::string{};
+    }
+
+    // Batch-by-block format: find "events" array and splice matching events
     const char* ekey = "\"events\"";
     const char* found = strstr(data, ekey);
     if (!found) return {};
@@ -250,17 +292,6 @@ static std::string filter_diffs_line(const std::string& raw,
     if (pos_after_key >= len || data[pos_after_key] != '[') return {};
     size_t arr_start = pos_after_key; // points at '['
 
-    // Build coin patterns (both compact and spaced forms)
-    std::vector<std::pair<std::string, size_t>> patterns;
-    patterns.reserve(coins.size() * 2);
-    for (auto& c : coins) {
-        std::string p1 = "\"coin\":\"" + c + "\"";
-        std::string p2 = "\"coin\": \"" + c + "\"";
-        patterns.push_back({p1, p1.size()});
-        patterns.push_back({p2, p2.size()});
-    }
-
-    // Scan events, splice matching ones
     std::string result;
     result.reserve(raw.size());
     result.append(data, arr_start + 1); // everything up to and including '['
@@ -296,8 +327,9 @@ static std::string filter_diffs_line(const std::string& raw,
     return result;
 }
 
-// Filter a fills batch JSON. Fill events come in pairs; check coin in
-// the first element of each pair and keep both elements together.
+// Filter a fills JSON line. In batch format fill events come in pairs;
+// check coin in the first element and keep both together.
+// Handles both batch-by-block (B) and line/single-event (L) formats.
 static std::string filter_fills_line(const std::string& raw,
                                      const std::unordered_set<std::string>& coins) {
     const char* data = raw.data();
@@ -305,7 +337,14 @@ static std::string filter_fills_line(const std::string& raw,
 
     if (!contains_any_quoted_coin(raw, coins)) return {};
 
-    // Find "events" key and its array value, handling optional whitespace
+    auto patterns = build_coin_patterns(coins);
+
+    // Line format: single fill event ["addr", fill_obj] — no block wrapper
+    if (raw.find("\"block_number\"") == std::string::npos) {
+        return coin_matches(data, 0, len, patterns) ? raw : std::string{};
+    }
+
+    // Batch-by-block format: find "events" array, process pairs
     const char* ekey = "\"events\"";
     const char* found = strstr(data, ekey);
     if (!found) return {};
@@ -314,16 +353,6 @@ static std::string filter_fills_line(const std::string& raw,
            data[pos_after_key] == ':' || data[pos_after_key] == '\t')) ++pos_after_key;
     if (pos_after_key >= len || data[pos_after_key] != '[') return {};
     size_t arr_start = pos_after_key; // points at '['
-
-    // Build coin patterns (both compact and spaced forms)
-    std::vector<std::pair<std::string, size_t>> patterns;
-    patterns.reserve(coins.size() * 2);
-    for (auto& c : coins) {
-        std::string p1 = "\"coin\":\"" + c + "\"";
-        std::string p2 = "\"coin\": \"" + c + "\"";
-        patterns.push_back({p1, p1.size()});
-        patterns.push_back({p2, p2.size()});
-    }
 
     std::string result;
     result.reserve(raw.size());
@@ -431,53 +460,13 @@ struct Client : public std::enable_shared_from_this<Client> {
     // receivers and to keep latency bounded.
     static constexpr size_t MAX_BATCH_BYTES = 4 * 1024 * 1024;  // 4 MB
 
-    // void kick_writer() {
-    //     if (writing || write_queue.empty() || !active) return;
-    //     writing = true;
-
-    //     // Coalesce queued messages into one buffer up to MAX_BATCH_BYTES.
-    //     // Clients parse by newline so batching is transparent.
-    //     auto batch = std::make_shared<std::string>();
-    //     size_t total = 0;
-    //     for (auto& m : write_queue) {
-    //         if (total > 0 && total + m->size() > MAX_BATCH_BYTES)
-    //             break;
-    //         total += m->size();
-    //     }
-    //     batch->reserve(total);
-    //     size_t consumed = 0;
-    //     while (!write_queue.empty()) {
-    //         auto& m = write_queue.front();
-    //         if (consumed > 0 && consumed + m->size() > MAX_BATCH_BYTES)
-    //             break;
-    //         consumed += m->size();
-    //         batch->append(*m);
-    //         write_queue.pop_front();
-    //     }
-
-    //     auto self = shared_from_this();
-    //     ws.async_write(
-    //         net::buffer(*batch),
-    //         [self, batch](beast::error_code ec, std::size_t) {
-    //             self->writing = false;
-    //             if (ec) {
-    //                 if (ec != websocket::error::closed &&
-    //                     ec != net::error::operation_aborted)
-    //                     LOG_D("Write error for %s: %s", self->addr.c_str(), ec.message().c_str());
-    //                 self->active = false;
-    //                 return;
-    //             }
-    //             // Drain any messages that arrived while writing
-    //             self->kick_writer();
-    //         });
-    // }
-
     void kick_writer() {
         if (writing || write_queue.empty() || !active) return;
         writing = true;
 
+        // Coalesce queued messages into one buffer up to MAX_BATCH_BYTES.
+        // Clients parse by newline so batching is transparent.
         auto batch = std::make_shared<std::string>();
-
         size_t total = 0;
         for (auto& m : write_queue) {
             if (total > 0 && total + m->size() > MAX_BATCH_BYTES)
@@ -485,7 +474,6 @@ struct Client : public std::enable_shared_from_this<Client> {
             total += m->size();
         }
         batch->reserve(total);
-
         size_t consumed = 0;
         while (!write_queue.empty()) {
             auto& m = write_queue.front();
@@ -504,29 +492,11 @@ struct Client : public std::enable_shared_from_this<Client> {
                 if (ec) {
                     if (ec != websocket::error::closed &&
                         ec != net::error::operation_aborted)
-                        LOG_D("Write error for %s: %s",
-                            self->addr.c_str(), ec.message().c_str());
+                        LOG_D("Write error for %s: %s", self->addr.c_str(), ec.message().c_str());
                     self->active = false;
                     return;
                 }
-                self->kick_writer();
-            });
-    }
-
-    void ping_if_idle() {
-        if (!active || writing) return;
-        writing = true;
-        auto self = shared_from_this();
-        ws.async_ping({},
-            [self](beast::error_code ec) {
-                self->writing = false;
-                if (ec) {
-                    if (ec != websocket::error::closed &&
-                        ec != net::error::operation_aborted)
-                        LOG_D("Ping error for %s: %s", self->addr.c_str(), ec.message().c_str());
-                    self->active = false;
-                    return;
-                }
+                // Drain any messages that arrived while writing
                 self->kick_writer();
             });
     }
@@ -546,14 +516,6 @@ class Dispatcher {
 public:
     uint64_t seq = 0;
     std::vector<std::shared_ptr<Client>> clients;
-
-    static constexpr int PING_INTERVAL_SECONDS = 5;
-
-    explicit Dispatcher(net::io_context& ioc)
-        : ping_timer_(ioc)
-    {
-        start_ping_timer();
-    }
 
     uint64_t next_seq() { return ++seq; }
 
@@ -640,23 +602,7 @@ public:
             clients.end());
     }
 
-    void stop() {
-        ping_timer_.cancel();
-    }
-
 private:
-    net::steady_timer ping_timer_;
-
-    void start_ping_timer() {
-        ping_timer_.expires_after(std::chrono::seconds(PING_INTERVAL_SECONDS));
-        ping_timer_.async_wait([this](beast::error_code ec) {
-            if (ec) return;
-            for (auto& client : clients)
-                client->ping_if_idle();
-            start_ping_timer();
-        });
-    }
-
     // Per-dispatch dedup cache: coin_key -> filtered message (or nullptr if no match)
     std::unordered_map<std::string, std::shared_ptr<const std::string>> filter_cache_;
 };
@@ -668,12 +614,12 @@ private:
 class InotifyWatcher {
 public:
     InotifyWatcher(net::io_context& ioc, Dispatcher& dispatcher,
-                   const std::string& data_dir)
+                   const std::string& data_dir, bool line_format = false)
         : ioc_(ioc)
         , dispatcher_(dispatcher)
         , data_dir_(data_dir)
-        , book_base_(data_dir + "/node_raw_book_diffs_by_block")
-        , fills_base_(data_dir + "/node_fills_by_block")
+        , book_base_(data_dir + (line_format ? "/node_raw_book_diffs" : "/node_raw_book_diffs_by_block"))
+        , fills_base_(data_dir + (line_format ? "/node_fills" : "/node_fills_by_block"))
         , rotation_timer_(ioc)
         , inotify_sd_(ioc)
     {
@@ -833,52 +779,13 @@ private:
         }
     }
 
-    static constexpr size_t DISPATCH_BATCH_MAX_LINES = 256;
-    static constexpr size_t DISPATCH_BATCH_MAX_BYTES = 16 * 1024 * 1024;  // 16 MB
-
-    // Per-channel pending queue and in-flight flag to preserve ordering
-    struct ChannelQueue {
-        std::deque<std::string> pending;
-        bool dispatching = false;  // true while a posted continuation exists
-    };
-    std::unordered_map<char, ChannelQueue> channel_queues_;
-
     void read_and_dispatch(const std::string& src_type) {
         auto it = tailers_.find(src_type);
         if (it == tailers_.end()) return;
         char channel = (src_type == "book") ? 'D' : 'F';
         auto lines = it->second.read_new_lines();
-        if (lines.empty()) return;
-
-        auto& q = channel_queues_[channel];
         for (auto& line : lines)
-            q.pending.push_back(std::move(line));
-
-        if (!q.dispatching)
-            dispatch_batch(channel);
-    }
-
-    void dispatch_batch(char channel) {
-        auto& q = channel_queues_[channel];
-        size_t batch_bytes = 0;
-        size_t count = 0;
-        while (!q.pending.empty()) {
-            if (count >= DISPATCH_BATCH_MAX_LINES) break;
-            batch_bytes += q.pending.front().size();
-            if (count > 0 && batch_bytes >= DISPATCH_BATCH_MAX_BYTES) break;
-            dispatcher_.dispatch(channel, q.pending.front());
-            q.pending.pop_front();
-            ++count;
-        }
-
-        if (!q.pending.empty()) {
-            q.dispatching = true;
-            net::post(ioc_, [this, channel]() {
-                dispatch_batch(channel);
-            });
-        } else {
-            q.dispatching = false;
-        }
+            dispatcher_.dispatch(channel, line);
     }
 
     void start_rotation_timer() {
@@ -1273,11 +1180,15 @@ struct Config {
     std::string host = "0.0.0.0";
     uint16_t ws_port = 8766;
     std::string data_dir;
+    std::string log_file;
     bool verbose = false;
+    bool line_format = false;
 
     Config() {
         const char* home = getenv("HOME");
-        data_dir = std::string(home ? home : "/root") + "/hl/data";
+        std::string home_str(home ? home : "/root");
+        data_dir = home_str + "/hl/data";
+        log_file = home_str + "/logs/hl_relay.log";
     }
 };
 
@@ -1313,12 +1224,18 @@ static Config parse_args(int argc, char* argv[]) {
             cfg.data_dir = argv[++i];
         else if (arg == "--verbose" || arg == "-v")
             cfg.verbose = true;
+        else if (arg == "--line-format" || arg == "-l")
+            cfg.line_format = true;
+        else if ((arg == "--log-file") && i + 1 < argc)
+            cfg.log_file = argv[++i];
         else if (arg == "--help" || arg == "-h") {
             fprintf(stderr,
                 "Usage: %s [options]\n"
                 "  --ws-port PORT    WebSocket listen port (default: 8766)\n"
                 "  --host ADDR       Bind address (default: 0.0.0.0)\n"
                 "  --data-dir PATH   Node data directory (default: ~/hl/data)\n"
+                "  --log-file PATH   Write logs to file in addition to stderr\n"
+                "  --line-format,-l  Use line/single-event format (node_raw_book_diffs, node_fills)\n"
                 "  --verbose, -v     Enable debug logging\n",
                 argv[0]);
             exit(0);
@@ -1333,12 +1250,13 @@ static Config parse_args(int argc, char* argv[]) {
 
 int main(int argc, char* argv[]) {
     Config cfg = parse_args(argc, argv);
-    if (cfg.verbose) g_log_level = LOG_DEBUG;
+    setup_logger(cfg.verbose, cfg.log_file);
 
     // Ignore SIGPIPE
     signal(SIGPIPE, SIG_IGN);
 
-    LOG_I("Starting hl_relay (C++): ws-port=%d data_dir=%s", cfg.ws_port, cfg.data_dir.c_str());
+    LOG_I("Starting hl_relay (C++): ws-port=%d data_dir=%s format=%s",
+          cfg.ws_port, cfg.data_dir.c_str(), cfg.line_format ? "line" : "batch-by-block");
 
     // Verify data directory exists
     struct stat st;
@@ -1348,7 +1266,7 @@ int main(int argc, char* argv[]) {
 
     net::io_context ioc{1};  // single-threaded
 
-    Dispatcher dispatcher(ioc);
+    Dispatcher dispatcher;
 
     // Set up WebSocket listener — fatal if port is unavailable
     std::shared_ptr<WsListener> listener;
@@ -1364,7 +1282,7 @@ int main(int argc, char* argv[]) {
     listener->run();
 
     // Set up inotify watcher
-    InotifyWatcher watcher(ioc, dispatcher, cfg.data_dir);
+    InotifyWatcher watcher(ioc, dispatcher, cfg.data_dir, cfg.line_format);
     watcher.start();
 
     // Signal handling
@@ -1373,7 +1291,6 @@ int main(int argc, char* argv[]) {
         LOG_I("Received signal %d, shutting down", sig);
         listener->stop();
         watcher.stop();
-        dispatcher.stop();
         // Close all client connections
         for (auto& client : dispatcher.clients) {
             client->active = false;
