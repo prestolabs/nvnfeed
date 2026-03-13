@@ -472,6 +472,24 @@ struct Client : public std::enable_shared_from_this<Client> {
             });
     }
 
+    void ping_if_idle() {
+        if (!active || writing) return;
+        writing = true;
+        auto self = shared_from_this();
+        ws.async_ping({},
+            [self](beast::error_code ec) {
+                self->writing = false;
+                if (ec) {
+                    if (ec != websocket::error::closed &&
+                        ec != net::error::operation_aborted)
+                        LOG_D("Ping error for %s: %s", self->addr.c_str(), ec.message().c_str());
+                    self->active = false;
+                    return;
+                }
+                self->kick_writer();
+            });
+    }
+
     void do_close() {
         beast::error_code ec;
         ws.async_close(websocket::close_code::going_away,
@@ -487,6 +505,14 @@ class Dispatcher {
 public:
     uint64_t seq = 0;
     std::vector<std::shared_ptr<Client>> clients;
+
+    static constexpr int PING_INTERVAL_SECONDS = 5;
+
+    explicit Dispatcher(net::io_context& ioc)
+        : ping_timer_(ioc)
+    {
+        start_ping_timer();
+    }
 
     uint64_t next_seq() { return ++seq; }
 
@@ -573,7 +599,23 @@ public:
             clients.end());
     }
 
+    void stop() {
+        ping_timer_.cancel();
+    }
+
 private:
+    net::steady_timer ping_timer_;
+
+    void start_ping_timer() {
+        ping_timer_.expires_after(std::chrono::seconds(PING_INTERVAL_SECONDS));
+        ping_timer_.async_wait([this](beast::error_code ec) {
+            if (ec) return;
+            for (auto& client : clients)
+                client->ping_if_idle();
+            start_ping_timer();
+        });
+    }
+
     // Per-dispatch dedup cache: coin_key -> filtered message (or nullptr if no match)
     std::unordered_map<std::string, std::shared_ptr<const std::string>> filter_cache_;
 };
@@ -1265,7 +1307,7 @@ int main(int argc, char* argv[]) {
 
     net::io_context ioc{1};  // single-threaded
 
-    Dispatcher dispatcher;
+    Dispatcher dispatcher(ioc);
 
     // Set up WebSocket listener — fatal if port is unavailable
     std::shared_ptr<WsListener> listener;
@@ -1290,6 +1332,7 @@ int main(int argc, char* argv[]) {
         LOG_I("Received signal %d, shutting down", sig);
         listener->stop();
         watcher.stop();
+        dispatcher.stop();
         // Close all client connections
         for (auto& client : dispatcher.clients) {
             client->active = false;
