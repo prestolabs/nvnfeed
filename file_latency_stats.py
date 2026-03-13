@@ -205,7 +205,7 @@ def main():
         has_coin = any(e.get("coin") in coins for e in events)
         if not has_coin and events:
             return
-
+        print(d)
         block_time = parse_iso_ns(d["block_time"])
         local_time = parse_iso_ns(d["local_time"])
 
