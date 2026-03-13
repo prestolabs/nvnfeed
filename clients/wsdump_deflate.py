@@ -48,16 +48,21 @@ class LatencyTracker:
 
     def __init__(self, interval: float = 10.0):
         self.interval = interval
-        # Window (reset each interval)
+        # Window (reset each interval) — batch format (B)
         self.node: list[float] = []
         self.relay: list[float] = []
         self.network: list[float] = []
         self.e2e: list[float] = []
-        # Accumulated (never reset)
+        # Accumulated (never reset) — batch format (B)
         self.all_node: list[float] = []
         self.all_relay: list[float] = []
         self.all_network: list[float] = []
         self.all_e2e: list[float] = []
+        # Window/accumulated — line format (L)
+        self.lnet: list[float] = []
+        self.all_lnet: list[float] = []
+        self.le2e: list[float] = []
+        self.all_le2e: list[float] = []
         self._last_report = time.monotonic()
         self._start = time.monotonic()
 
@@ -81,6 +86,28 @@ class LatencyTracker:
         print(f"[{channel}] blk={block_num} "
               f"e2e={e2e_ms:7.1f}ms  node={node_ms:7.1f}ms  "
               f"relay={relay_ms:5.1f}ms  net={net_ms:7.1f}ms",
+              flush=True)
+
+        now = time.monotonic()
+        if now - self._last_report >= self.interval:
+            self._print_stats()
+            self._last_report = now
+
+    def record_net(self, relay_ns: int, recv_ns: int, channel: str, seq: int,
+                   block_time_ns: int):
+        """Record latency for line-format messages.
+        block_time_ns: fill event time in ns (FL); relay_ns for book diffs (DL, no timestamp)."""
+        net_ms = (recv_ns - relay_ns) / 1e6
+        e2e_ms = (recv_ns - block_time_ns) / 1e6
+
+        self.lnet.append(net_ms)
+        self.all_lnet.append(net_ms)
+        self.le2e.append(e2e_ms)
+        self.all_le2e.append(e2e_ms)
+
+        print(f"[{channel}] blk={seq} "
+              f"e2e={e2e_ms:7.1f}ms  node=    N/Ams  "
+              f"relay=  N/Ams  net={net_ms:7.1f}ms",
               flush=True)
 
         now = time.monotonic()
@@ -112,7 +139,9 @@ class LatencyTracker:
     def _print_stats(self):
         n = len(self.e2e)
         n_all = len(self.all_e2e)
-        if n == 0 and n_all == 0:
+        nl = len(self.lnet)
+        nl_all = len(self.all_lnet)
+        if n == 0 and n_all == 0 and nl == 0 and nl_all == 0:
             return
         elapsed = time.monotonic() - self._start
         print(f"\n--- Latency stats ---", file=sys.stderr)
@@ -129,12 +158,24 @@ class LatencyTracker:
                 [("e2e", self.all_e2e), ("node", self.all_node),
                  ("relay", self.all_relay), ("network", self.all_network)])
 
+        if nl > 0:
+            self._print_section(
+                f"Line-fmt last {self.interval:.0f}s ({nl} msgs):",
+                [("e2e", self.le2e), ("network", self.lnet)])
+
+        if nl_all > 0:
+            self._print_section(
+                f"Line-fmt accumulated ({nl_all} msgs, {elapsed:.0f}s):",
+                [("e2e", self.all_le2e), ("network", self.all_lnet)])
+
         print(file=sys.stderr, flush=True)
         # Reset window
         self.node.clear()
         self.relay.clear()
         self.network.clear()
         self.e2e.clear()
+        self.lnet.clear()
+        self.le2e.clear()
 
 
 async def main():
@@ -182,7 +223,7 @@ async def main():
 
     # WebSocket upgrade
     key = base64.b64encode(os.urandom(16)).decode()
-    ext_header = "Sec-WebSocket-Extensions: permessage-deflate\r\n" if request_deflate else ""
+    ext_header = "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover\r\n" if request_deflate else ""
     req = (
         f"GET {path} HTTP/1.1\r\n"
         f"Host: {host}:{port}\r\n"
@@ -201,11 +242,14 @@ async def main():
     while b"\r\n\r\n" not in resp:
         resp += await reader.read(4096)
     resp_str = resp.decode()
-    deflate_on = "permessage-deflate" in resp_str
+    deflate_on = False
     accept_key = None
     for line in resp_str.split("\r\n"):
-        if line.lower().startswith("sec-websocket-accept:"):
+        ll = line.lower()
+        if ll.startswith("sec-websocket-accept:"):
             accept_key = line.split(":", 1)[1].strip()
+        elif ll.startswith("sec-websocket-extensions:") and "permessage-deflate" in ll:
+            deflate_on = True
 
     # Verify accept key
     expected = base64.b64encode(hashlib.sha1(key.encode() + WS_MAGIC).digest()).decode()
@@ -220,9 +264,7 @@ async def main():
         print(f"Latency tracking: on (stats every {args.latency_interval:.0f}s)", file=sys.stderr)
         print(f"NOTE: network latency includes clock skew between machines", file=sys.stderr)
 
-    # Set up compressor/decompressor if negotiated
     compressor = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -15) if deflate_on else None
-    decompressor = zlib.decompressobj(-15) if deflate_on else None
 
     def encode_frame(data: bytes, opcode: int = 0x1) -> bytes:
         payload = data
@@ -248,23 +290,86 @@ async def main():
         header.extend(mask_key)
         return bytes(header) + masked
 
-    async def read_frame() -> tuple[int, bytes]:
+    server_no_context_takeover = False
+    for line in resp_str.split("\r\n"):
+        if line.lower().startswith("sec-websocket-extensions:"):
+            ext = line.split(":", 1)[1]
+            if "server_no_context_takeover" in ext:
+                server_no_context_takeover = True
+
+    recv_decompressor = None if server_no_context_takeover else zlib.decompressobj(-15)
+
+
+    def decompress_message(data: bytes) -> bytes:
+        try:
+            if server_no_context_takeover:
+                return zlib.decompressobj(-15).decompress(data + _DEFLATE_TAIL)
+            else:
+                return recv_decompressor.decompress(data + _DEFLATE_TAIL)
+        except zlib.error as exc:
+            sys.stderr.write(
+                f"[ZLIB ERR] {exc}  no_ctx={server_no_context_takeover}\n"
+                f"  payload hex ({len(data)} bytes): {data[:64].hex()}\n"
+            )
+            sys.stderr.flush()
+            raise
+
+    async def read_one_frame():
         h = await reader.readexactly(2)
-        opcode = h[0] & 0x0F
+        fin = bool(h[0] & 0x80)
         rsv1 = bool(h[0] & 0x40)
+        opcode = h[0] & 0x0F
+
         length = h[1] & 0x7F
         if length == 126:
             length = struct.unpack(">H", await reader.readexactly(2))[0]
         elif length == 127:
             length = struct.unpack(">Q", await reader.readexactly(8))[0]
+
         masked = bool(h[1] & 0x80)
         mask_key = await reader.readexactly(4) if masked else None
         payload = await reader.readexactly(length)
+
         if mask_key:
             payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
-        if rsv1 and decompressor:
-            payload = decompressor.decompress(payload + _DEFLATE_TAIL)
-        return opcode, payload
+
+        return fin, rsv1, opcode, payload
+    
+    async def read_message():
+        fragments = []
+        msg_opcode = None
+        compressed = False
+
+        while True:
+            fin, rsv1, opcode, payload = await read_one_frame()
+
+            # control frames
+            if opcode == 0x8:   # close
+                return opcode, payload
+            if opcode == 0x9:   # ping
+                writer.write(encode_frame(payload, opcode=0xA))
+                await writer.drain()
+                continue
+            if opcode == 0xA:   # pong
+                continue
+
+            # start of data message
+            if opcode in (0x1, 0x2):
+                msg_opcode = opcode
+                compressed = rsv1
+                fragments = [payload]
+            elif opcode == 0x0:  # continuation
+                if msg_opcode is None:
+                    raise RuntimeError("unexpected continuation frame")
+                fragments.append(payload)
+            else:
+                raise RuntimeError(f"unexpected opcode 0x{opcode:x}")
+
+            if fin:
+                data = b"".join(fragments)
+                if compressed and deflate_on:
+                    data = decompress_message(data)
+                return msg_opcode, data
 
     # Send subscription
     writer.write(encode_frame(sub.encode()))
@@ -274,7 +379,7 @@ async def main():
     # Read and print messages
     try:
         while True:
-            opcode, payload = await read_frame()
+            opcode, payload = await read_message()
             recv_ns = time.time_ns()
             if opcode == 0x1:  # text
                 # The C++ relay may coalesce multiple messages into one
@@ -317,14 +422,17 @@ def _process_latency(text: str, recv_ns: int, tracker: LatencyTracker):
             print(text, flush=True)
             return
         channel = parts[0]
+        seq = int(parts[1])
         relay_ns = int(parts[2])
         json_str = parts[3]
     except (ValueError, IndexError):
         print(text, flush=True)
         return
 
-    # Parse JSON for block_time and local_time (batch format only)
-    if channel.endswith("B"):
+    fmt = channel[-1] if channel else ""
+
+    if fmt == "B":
+        # Batch format: JSON has block_time, local_time, block_number
         try:
             data = json.loads(json_str)
             block_time_iso = data.get("block_time")
@@ -338,6 +446,18 @@ def _process_latency(text: str, recv_ns: int, tracker: LatencyTracker):
                 return
         except (json.JSONDecodeError, KeyError, ValueError):
             pass
+    elif fmt == "L":
+        # Line format: fills have a "time" field (epoch ms) → compute e2e.
+        # Book diffs have no timestamp → net only.
+        block_time_ns = relay_ns
+        if channel.startswith("F"):
+            try:
+                event = json.loads(json_str)
+                block_time_ns = event[1]["time"] * 1_000_000  # ms → ns
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                pass
+        tracker.record_net(relay_ns, recv_ns, channel, seq, block_time_ns)
+        return
 
     # Fallback: can't extract timestamps, just print
     print(text, flush=True)
