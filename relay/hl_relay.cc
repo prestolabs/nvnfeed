@@ -750,13 +750,52 @@ private:
         }
     }
 
+    static constexpr size_t DISPATCH_BATCH_MAX_LINES = 256;
+    static constexpr size_t DISPATCH_BATCH_MAX_BYTES = 16 * 1024 * 1024;  // 16 MB
+
+    // Per-channel pending queue and in-flight flag to preserve ordering
+    struct ChannelQueue {
+        std::deque<std::string> pending;
+        bool dispatching = false;  // true while a posted continuation exists
+    };
+    std::unordered_map<char, ChannelQueue> channel_queues_;
+
     void read_and_dispatch(const std::string& src_type) {
         auto it = tailers_.find(src_type);
         if (it == tailers_.end()) return;
         char channel = (src_type == "book") ? 'D' : 'F';
         auto lines = it->second.read_new_lines();
+        if (lines.empty()) return;
+
+        auto& q = channel_queues_[channel];
         for (auto& line : lines)
-            dispatcher_.dispatch(channel, line);
+            q.pending.push_back(std::move(line));
+
+        if (!q.dispatching)
+            dispatch_batch(channel);
+    }
+
+    void dispatch_batch(char channel) {
+        auto& q = channel_queues_[channel];
+        size_t batch_bytes = 0;
+        size_t count = 0;
+        while (!q.pending.empty()) {
+            if (count >= DISPATCH_BATCH_MAX_LINES) break;
+            batch_bytes += q.pending.front().size();
+            if (count > 0 && batch_bytes >= DISPATCH_BATCH_MAX_BYTES) break;
+            dispatcher_.dispatch(channel, q.pending.front());
+            q.pending.pop_front();
+            ++count;
+        }
+
+        if (!q.pending.empty()) {
+            q.dispatching = true;
+            net::post(ioc_, [this, channel]() {
+                dispatch_batch(channel);
+            });
+        } else {
+            q.dispatching = false;
+        }
     }
 
     void start_rotation_timer() {
