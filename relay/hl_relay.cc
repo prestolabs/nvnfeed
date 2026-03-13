@@ -267,18 +267,18 @@ build_coin_patterns(const std::unordered_set<std::string>& coins) {
 // Handles both batch-by-block (B) and line/single-event (L) formats.
 // Uses raw string splicing — no DOM parse, no re-serialize.
 static std::string filter_diffs_line(const std::string& raw,
-                                     const std::unordered_set<std::string>& coins) {
+                                     const std::vector<std::pair<std::string, size_t>>& patterns) {
     const char* data = raw.data();
     const size_t len = raw.size();
 
     // Fast string pre-check
-    if (!contains_any_quoted_coin(raw, coins)) return {};
+    // if (!contains_any_quoted_coin(raw, coins)) return {};
 
-    auto patterns = build_coin_patterns(coins);
+    // auto patterns = build_coin_patterns(coins);
 
-    // Line format: single event {"coin":"BTC",...} — no block wrapper
+    // // Line format: single event {"coin":"BTC",...} — no block wrapper
     if (raw.find("\"block_number\"") == std::string::npos) {
-        return coin_matches(data, 0, len, patterns) ? raw : std::string{};
+        return coin_matches(data, 0, len, client->) ? raw : std::string{};
     }
 
     // Batch-by-block format: find "events" array and splice matching events
@@ -331,7 +331,7 @@ static std::string filter_diffs_line(const std::string& raw,
 // check coin in the first element and keep both together.
 // Handles both batch-by-block (B) and line/single-event (L) formats.
 static std::string filter_fills_line(const std::string& raw,
-                                     const std::unordered_set<std::string>& coins) {
+                                     const std::vector<std::pair<std::string, size_t>>& patterns) {
     const char* data = raw.data();
     const size_t len = raw.size();
 
@@ -419,7 +419,9 @@ struct Client : public std::enable_shared_from_this<Client> {
     std::string addr;
     std::unordered_set<std::string> coins;  // empty = all (unfiltered)
     bool has_coin_filter = false;
-    std::string coin_key;                   // sorted coins joined by ',' for dedup
+    std::string coin_key;   
+    std::vector<std::pair<std::string, size_t>> coin_patterns;
+    std::vector<std::string> quoted_coins;                // sorted coins joined by ',' for dedup
     std::unordered_set<char> channels;      // 'D' and/or 'F'
     std::deque<std::shared_ptr<const std::string>> write_queue;
     int consecutive_drops = 0;
@@ -568,9 +570,9 @@ public:
                 // Cache miss — compute filter
                 std::string filtered;
                 if (channel == 'D')
-                    filtered = filter_diffs_line(raw_line, client->coins);
+                    filtered = filter_diffs_line(raw_line, client->coin_patterns);
                 else
-                    filtered = filter_fills_line(raw_line, client->coins);
+                    filtered = filter_fills_line(raw_line, client->coin_patterns);
 
                 if (filtered.empty()) {
                     // No match — cache nullptr so we skip for other
@@ -978,6 +980,16 @@ private:
                 if (!client_->coin_key.empty()) client_->coin_key += ',';
                 client_->coin_key += c;
             }
+        }
+
+        for (const auto& c : client_->coins) {
+            std::string p1 = "\"coin\":\"" + c + "\"";
+            std::string p2 = "\"coin\": \"" + c + "\"";
+            client_->coin_patterns.push_back({p1, p1.size()});
+            client_->coin_patterns.push_back({p2, p2.size()});
+
+            std::string q = "\"" + c + "\"";
+            client_->quoted_coins.push_back(std::move(q));
         }
 
         // Parse channels
