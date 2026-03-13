@@ -431,20 +431,54 @@ struct Client : public std::enable_shared_from_this<Client> {
     // receivers and to keep latency bounded.
     static constexpr size_t MAX_BATCH_BYTES = 4 * 1024 * 1024;  // 4 MB
 
+    // void kick_writer() {
+    //     if (writing || write_queue.empty() || !active) return;
+    //     writing = true;
+
+    //     // Coalesce queued messages into one buffer up to MAX_BATCH_BYTES.
+    //     // Clients parse by newline so batching is transparent.
+    //     auto batch = std::make_shared<std::string>();
+    //     size_t total = 0;
+    //     for (auto& m : write_queue) {
+    //         if (total > 0 && total + m->size() > MAX_BATCH_BYTES)
+    //             break;
+    //         total += m->size();
+    //     }
+    //     batch->reserve(total);
+    //     size_t consumed = 0;
+    //     while (!write_queue.empty()) {
+    //         auto& m = write_queue.front();
+    //         if (consumed > 0 && consumed + m->size() > MAX_BATCH_BYTES)
+    //             break;
+    //         consumed += m->size();
+    //         batch->append(*m);
+    //         write_queue.pop_front();
+    //     }
+
+    //     auto self = shared_from_this();
+    //     ws.async_write(
+    //         net::buffer(*batch),
+    //         [self, batch](beast::error_code ec, std::size_t) {
+    //             self->writing = false;
+    //             if (ec) {
+    //                 if (ec != websocket::error::closed &&
+    //                     ec != net::error::operation_aborted)
+    //                     LOG_D("Write error for %s: %s", self->addr.c_str(), ec.message().c_str());
+    //                 self->active = false;
+    //                 return;
+    //             }
+    //             // Drain any messages that arrived while writing
+    //             self->kick_writer();
+    //         });
+    // }
+
     void kick_writer() {
         if (writing || write_queue.empty() || !active) return;
         writing = true;
 
-        // Coalesce queued messages into one buffer up to MAX_BATCH_BYTES.
-        // Clients parse by newline so batching is transparent.
         auto batch = std::make_shared<std::string>();
-        size_t total = 0;
-        for (auto& m : write_queue) {
-            if (total > 0 && total + m->size() > MAX_BATCH_BYTES)
-                break;
-            total += m->size();
-        }
-        batch->reserve(total);
+        batch->reserve(std::min(current_queued_bytes, MAX_BATCH_BYTES)); // optional tracked counter
+
         size_t consumed = 0;
         while (!write_queue.empty()) {
             auto& m = write_queue.front();
@@ -456,18 +490,17 @@ struct Client : public std::enable_shared_from_this<Client> {
         }
 
         auto self = shared_from_this();
-        ws.async_write(
-            net::buffer(*batch),
+        ws.async_write(net::buffer(*batch),
             [self, batch](beast::error_code ec, std::size_t) {
                 self->writing = false;
                 if (ec) {
                     if (ec != websocket::error::closed &&
                         ec != net::error::operation_aborted)
-                        LOG_D("Write error for %s: %s", self->addr.c_str(), ec.message().c_str());
+                        LOG_D("Write error for %s: %s",
+                            self->addr.c_str(), ec.message().c_str());
                     self->active = false;
                     return;
                 }
-                // Drain any messages that arrived while writing
                 self->kick_writer();
             });
     }
