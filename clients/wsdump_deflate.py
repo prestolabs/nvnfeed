@@ -223,7 +223,7 @@ async def main():
 
     # WebSocket upgrade
     key = base64.b64encode(os.urandom(16)).decode()
-    ext_header = "Sec-WebSocket-Extensions: permessage-deflate\r\n" if request_deflate else ""
+    ext_header = "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover\r\n" if request_deflate else ""
     req = (
         f"GET {path} HTTP/1.1\r\n"
         f"Host: {host}:{port}\r\n"
@@ -243,7 +243,6 @@ async def main():
         resp += await reader.read(4096)
     resp_str = resp.decode()
     deflate_on = False
-    no_context_takeover = False  # server_no_context_takeover: fresh decompressor per frame
     accept_key = None
     for line in resp_str.split("\r\n"):
         ll = line.lower()
@@ -251,7 +250,6 @@ async def main():
             accept_key = line.split(":", 1)[1].strip()
         elif ll.startswith("sec-websocket-extensions:") and "permessage-deflate" in ll:
             deflate_on = True
-            no_context_takeover = "server_no_context_takeover" in ll
 
     # Verify accept key
     expected = base64.b64encode(hashlib.sha1(key.encode() + WS_MAGIC).digest()).decode()
@@ -261,15 +259,13 @@ async def main():
 
     status_line = resp_str.split("\r\n")[0]
     print(f"Connected: {status_line}", file=sys.stderr)
-    print(f"Compression: {'permessage-deflate' if deflate_on else 'off'}"
-          + (" (no_context_takeover)" if no_context_takeover else ""), file=sys.stderr)
+    print(f"Compression: {'permessage-deflate' if deflate_on else 'off'}", file=sys.stderr)
     if tracker:
         print(f"Latency tracking: on (stats every {args.latency_interval:.0f}s)", file=sys.stderr)
         print(f"NOTE: network latency includes clock skew between machines", file=sys.stderr)
 
-    # Set up compressor/decompressor if negotiated
+    # Set up compressor if negotiated (decompressor is per-frame due to server_no_context_takeover)
     compressor = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -15) if deflate_on else None
-    decompressor = zlib.decompressobj(-15) if deflate_on else None
 
     def encode_frame(data: bytes, opcode: int = 0x1) -> bytes:
         payload = data
@@ -310,10 +306,7 @@ async def main():
         if mask_key:
             payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
         if rsv1 and deflate_on:
-            if no_context_takeover:
-                payload = zlib.decompressobj(-15).decompress(payload + _DEFLATE_TAIL)
-            else:
-                payload = decompressor.decompress(payload + _DEFLATE_TAIL)
+            payload = zlib.decompressobj(-15).decompress(payload + _DEFLATE_TAIL)
         return opcode, payload
 
     # Send subscription
