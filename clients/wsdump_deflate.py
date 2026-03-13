@@ -306,7 +306,16 @@ async def main():
         if mask_key:
             payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
         if rsv1 and deflate_on:
-            payload = zlib.decompressobj(-15).decompress(payload + _DEFLATE_TAIL)
+            try:
+                payload = zlib.decompressobj(-15).decompress(payload + _DEFLATE_TAIL)
+            except zlib.error as exc:
+                sys.stderr.write(
+                    f"[ZLIB ERR] {exc}\n"
+                    f"  opcode=0x{opcode:x} length={length} rsv1={rsv1}\n"
+                    f"  payload hex ({len(payload)} bytes): {payload[:64].hex()}\n"
+                )
+                sys.stderr.flush()
+                raise
         return opcode, payload
 
     # Send subscription
