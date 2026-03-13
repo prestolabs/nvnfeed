@@ -20,11 +20,12 @@
 #include <signal.h>
 
 #include <spdlog/spdlog.h>
-#include <spdlog/sinks/stderr_color_sink.h>
+#include <spdlog/sinks/ansicolor_sink.h>
 #include <spdlog/sinks/basic_file_sink.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cstdarg>
 #include <cstring>
 #include <ctime>
 #include <deque>
@@ -65,7 +66,7 @@ static void log_msg(spdlog::level::level_enum level, const char* fmt, ...) {
 static void setup_logger(bool verbose, const std::string& log_file) {
     std::vector<spdlog::sink_ptr> sinks;
 
-    auto stderr_sink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
+    auto stderr_sink = std::make_shared<spdlog::sinks::ansicolor_stderr_sink_mt>();
     stderr_sink->set_pattern("[%Y-%m-%dT%H:%M:%S.%e] [%^%l%$] %v");
     sinks.push_back(stderr_sink);
 
