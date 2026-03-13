@@ -3,7 +3,7 @@
 // Tails hl-node data files via inotify, streams raw JSON lines to WebSocket
 // clients. Supports per-coin filtering and channel selection.
 //
-// Build: g++ -std=c++17 -O2 -o relay/hl_relay relay/hl_relay.cc -lpthread
+// Build: see relay/build.sh  (requires spdlog headers in relay/spdlog/)
 // Usage: ./relay/hl_relay --ws-port 8766 --data-dir ~/hl/data
 
 #include <rapidjson/document.h>
@@ -18,6 +18,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
+
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/stderr_color_sink.h>
+#include <spdlog/sinks/basic_file_sink.h>
 
 #include <algorithm>
 #include <chrono>
@@ -38,35 +42,44 @@ namespace http = beast::http;
 using tcp = net::ip::tcp;
 
 // ============================================================================
-// Logging
+// Logging — printf-style wrappers over spdlog
 // ============================================================================
 
-enum LogLevel { LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR };
-static LogLevel g_log_level = LOG_INFO;
-
-static void log_msg(LogLevel level, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
-static void log_msg(LogLevel level, const char* fmt, ...) {
-    if (level < g_log_level) return;
-    static const char* level_names[] = {"DEBUG", "INFO", "WARN", "ERROR"};
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    struct tm tm;
-    gmtime_r(&ts.tv_sec, &tm);
-    char tbuf[32];
-    snprintf(tbuf, sizeof(tbuf), "%02d:%02d:%02d.%03ld",
-             tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000);
-    fprintf(stderr, "%s %-5s hl_relay: ", tbuf, level_names[level]);
+// Forward declaration so LOG_* macros work before setup_logger() is called.
+static void log_msg(spdlog::level::level_enum level, const char* fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+static void log_msg(spdlog::level::level_enum level, const char* fmt, ...) {
+    char buf[2048];
     va_list args;
     va_start(args, fmt);
-    vfprintf(stderr, fmt, args);
+    vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    fprintf(stderr, "\n");
+    spdlog::log(level, buf);
 }
 
-#define LOG_D(...) log_msg(LOG_DEBUG, __VA_ARGS__)
-#define LOG_I(...) log_msg(LOG_INFO, __VA_ARGS__)
-#define LOG_W(...) log_msg(LOG_WARN, __VA_ARGS__)
-#define LOG_E(...) log_msg(LOG_ERROR, __VA_ARGS__)
+#define LOG_D(...) log_msg(spdlog::level::debug, __VA_ARGS__)
+#define LOG_I(...) log_msg(spdlog::level::info,  __VA_ARGS__)
+#define LOG_W(...) log_msg(spdlog::level::warn,  __VA_ARGS__)
+#define LOG_E(...) log_msg(spdlog::level::err,   __VA_ARGS__)
+
+static void setup_logger(bool verbose, const std::string& log_file) {
+    std::vector<spdlog::sink_ptr> sinks;
+
+    auto stderr_sink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
+    stderr_sink->set_pattern("[%Y-%m-%dT%H:%M:%S.%e] [%^%l%$] %v");
+    sinks.push_back(stderr_sink);
+
+    if (!log_file.empty()) {
+        auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(log_file, /*truncate=*/false);
+        file_sink->set_pattern("[%Y-%m-%dT%H:%M:%S.%e] [%l] %v");
+        sinks.push_back(file_sink);
+    }
+
+    auto logger = std::make_shared<spdlog::logger>("hl_relay", sinks.begin(), sinks.end());
+    logger->set_level(verbose ? spdlog::level::debug : spdlog::level::info);
+    logger->flush_on(spdlog::level::warn);
+    spdlog::set_default_logger(logger);
+}
 
 // ============================================================================
 // FileTailer — POSIX I/O based file tailing
@@ -1160,6 +1173,7 @@ struct Config {
     std::string host = "0.0.0.0";
     uint16_t ws_port = 8766;
     std::string data_dir;
+    std::string log_file;
     bool verbose = false;
     bool line_format = false;
 
@@ -1203,12 +1217,15 @@ static Config parse_args(int argc, char* argv[]) {
             cfg.verbose = true;
         else if (arg == "--line-format" || arg == "-l")
             cfg.line_format = true;
+        else if ((arg == "--log-file") && i + 1 < argc)
+            cfg.log_file = argv[++i];
         else if (arg == "--help" || arg == "-h") {
             fprintf(stderr,
                 "Usage: %s [options]\n"
                 "  --ws-port PORT    WebSocket listen port (default: 8766)\n"
                 "  --host ADDR       Bind address (default: 0.0.0.0)\n"
                 "  --data-dir PATH   Node data directory (default: ~/hl/data)\n"
+                "  --log-file PATH   Write logs to file in addition to stderr\n"
                 "  --line-format,-l  Use line/single-event format (node_raw_book_diffs, node_fills)\n"
                 "  --verbose, -v     Enable debug logging\n",
                 argv[0]);
@@ -1224,7 +1241,7 @@ static Config parse_args(int argc, char* argv[]) {
 
 int main(int argc, char* argv[]) {
     Config cfg = parse_args(argc, argv);
-    if (cfg.verbose) g_log_level = LOG_DEBUG;
+    setup_logger(cfg.verbose, cfg.log_file);
 
     // Ignore SIGPIPE
     signal(SIGPIPE, SIG_IGN);
