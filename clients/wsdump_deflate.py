@@ -242,11 +242,16 @@ async def main():
     while b"\r\n\r\n" not in resp:
         resp += await reader.read(4096)
     resp_str = resp.decode()
-    deflate_on = "permessage-deflate" in resp_str
+    deflate_on = False
+    no_context_takeover = False  # server_no_context_takeover: fresh decompressor per frame
     accept_key = None
     for line in resp_str.split("\r\n"):
-        if line.lower().startswith("sec-websocket-accept:"):
+        ll = line.lower()
+        if ll.startswith("sec-websocket-accept:"):
             accept_key = line.split(":", 1)[1].strip()
+        elif ll.startswith("sec-websocket-extensions:") and "permessage-deflate" in ll:
+            deflate_on = True
+            no_context_takeover = "server_no_context_takeover" in ll
 
     # Verify accept key
     expected = base64.b64encode(hashlib.sha1(key.encode() + WS_MAGIC).digest()).decode()
@@ -256,7 +261,8 @@ async def main():
 
     status_line = resp_str.split("\r\n")[0]
     print(f"Connected: {status_line}", file=sys.stderr)
-    print(f"Compression: {'permessage-deflate' if deflate_on else 'off'}", file=sys.stderr)
+    print(f"Compression: {'permessage-deflate' if deflate_on else 'off'}"
+          + (" (no_context_takeover)" if no_context_takeover else ""), file=sys.stderr)
     if tracker:
         print(f"Latency tracking: on (stats every {args.latency_interval:.0f}s)", file=sys.stderr)
         print(f"NOTE: network latency includes clock skew between machines", file=sys.stderr)
@@ -303,8 +309,11 @@ async def main():
         payload = await reader.readexactly(length)
         if mask_key:
             payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
-        if rsv1 and decompressor:
-            payload = decompressor.decompress(payload + _DEFLATE_TAIL)
+        if rsv1 and deflate_on:
+            if no_context_takeover:
+                payload = zlib.decompressobj(-15).decompress(payload + _DEFLATE_TAIL)
+            else:
+                payload = decompressor.decompress(payload + _DEFLATE_TAIL)
         return opcode, payload
 
     # Send subscription
