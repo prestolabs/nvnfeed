@@ -235,15 +235,12 @@ static bool coin_matches(const char* data, size_t start, size_t end,
     return false;
 }
 
-static bool contains_any_quoted_coin(const std::string& raw,
-                                     const std::unordered_set<std::string>& coins) {
-    for (const auto& c : coins) {
-        std::string quoted;
-        quoted.reserve(c.size() + 2);
-        quoted.push_back('"');
-        quoted.append(c);
-        quoted.push_back('"');
-        if (raw.find(quoted) != std::string::npos)
+static bool contains_any_quoted_coin(
+    const std::string& raw,
+    const std::vector<std::string>& quoted_coins)
+{
+    for (const auto& q : quoted_coins) {
+        if (raw.find(q) != std::string::npos)
             return true;
     }
     return false;
