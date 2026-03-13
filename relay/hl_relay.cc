@@ -569,10 +569,10 @@ public:
                 // Cache miss — compute filter
                 std::string filtered;
                 if (channel == 'D')
-                    filtered = filter_diffs_line(raw_line, client->coin_patterns);
+                    filtered = filter_diffs_line(raw_line, client->coin_patterns, client->quoted_coins);
                 else
                 
-                    filtered = filter_fills_line(raw_line, client->coin_patterns);
+                    filtered = filter_fills_line(raw_line, client->coin_patterns, client->quoted_coins);
 
                 if (filtered.empty()) {
                     // No match — cache nullptr so we skip for other
