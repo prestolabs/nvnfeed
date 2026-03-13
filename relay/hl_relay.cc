@@ -477,7 +477,14 @@ struct Client : public std::enable_shared_from_this<Client> {
         writing = true;
 
         auto batch = std::make_shared<std::string>();
-        batch->reserve(std::min(current_queued_bytes, MAX_BATCH_BYTES)); // optional tracked counter
+
+        size_t total = 0;
+        for (auto& m : write_queue) {
+            if (total > 0 && total + m->size() > MAX_BATCH_BYTES)
+                break;
+            total += m->size();
+        }
+        batch->reserve(total);
 
         size_t consumed = 0;
         while (!write_queue.empty()) {
@@ -490,7 +497,8 @@ struct Client : public std::enable_shared_from_this<Client> {
         }
 
         auto self = shared_from_this();
-        ws.async_write(net::buffer(*batch),
+        ws.async_write(
+            net::buffer(*batch),
             [self, batch](beast::error_code ec, std::size_t) {
                 self->writing = false;
                 if (ec) {
