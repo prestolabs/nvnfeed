@@ -264,7 +264,6 @@ async def main():
         print(f"Latency tracking: on (stats every {args.latency_interval:.0f}s)", file=sys.stderr)
         print(f"NOTE: network latency includes clock skew between machines", file=sys.stderr)
 
-    # Set up compressor if negotiated (decompressor is per-frame due to server_no_context_takeover)
     compressor = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -15) if deflate_on else None
 
     def encode_frame(data: bytes, opcode: int = 0x1) -> bytes:
@@ -291,32 +290,86 @@ async def main():
         header.extend(mask_key)
         return bytes(header) + masked
 
-    async def read_frame() -> tuple[int, bytes]:
+    server_no_context_takeover = False
+    for line in resp_str.split("\r\n"):
+        if line.lower().startswith("sec-websocket-extensions:"):
+            ext = line.split(":", 1)[1]
+            if "server_no_context_takeover" in ext:
+                server_no_context_takeover = True
+
+    recv_decompressor = None if server_no_context_takeover else zlib.decompressobj(-15)
+
+
+    def decompress_message(data: bytes) -> bytes:
+        try:
+            if server_no_context_takeover:
+                return zlib.decompressobj(-15).decompress(data + _DEFLATE_TAIL)
+            else:
+                return recv_decompressor.decompress(data + _DEFLATE_TAIL)
+        except zlib.error as exc:
+            sys.stderr.write(
+                f"[ZLIB ERR] {exc}  no_ctx={server_no_context_takeover}\n"
+                f"  payload hex ({len(data)} bytes): {data[:64].hex()}\n"
+            )
+            sys.stderr.flush()
+            raise
+
+    async def read_one_frame():
         h = await reader.readexactly(2)
-        opcode = h[0] & 0x0F
+        fin = bool(h[0] & 0x80)
         rsv1 = bool(h[0] & 0x40)
+        opcode = h[0] & 0x0F
+
         length = h[1] & 0x7F
         if length == 126:
             length = struct.unpack(">H", await reader.readexactly(2))[0]
         elif length == 127:
             length = struct.unpack(">Q", await reader.readexactly(8))[0]
+
         masked = bool(h[1] & 0x80)
         mask_key = await reader.readexactly(4) if masked else None
         payload = await reader.readexactly(length)
+
         if mask_key:
             payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
-        if rsv1 and deflate_on:
-            try:
-                payload = zlib.decompressobj(-15).decompress(payload + _DEFLATE_TAIL)
-            except zlib.error as exc:
-                sys.stderr.write(
-                    f"[ZLIB ERR] {exc}\n"
-                    f"  opcode=0x{opcode:x} length={length} rsv1={rsv1}\n"
-                    f"  payload hex ({len(payload)} bytes): {payload[:64].hex()}\n"
-                )
-                sys.stderr.flush()
-                raise
-        return opcode, payload
+
+        return fin, rsv1, opcode, payload
+    
+    async def read_message():
+        fragments = []
+        msg_opcode = None
+        compressed = False
+
+        while True:
+            fin, rsv1, opcode, payload = await read_one_frame()
+
+            # control frames
+            if opcode == 0x8:   # close
+                return opcode, payload
+            if opcode == 0x9:   # ping
+                writer.write(encode_frame(payload, opcode=0xA))
+                await writer.drain()
+                continue
+            if opcode == 0xA:   # pong
+                continue
+
+            # start of data message
+            if opcode in (0x1, 0x2):
+                msg_opcode = opcode
+                compressed = rsv1
+                fragments = [payload]
+            elif opcode == 0x0:  # continuation
+                if msg_opcode is None:
+                    raise RuntimeError("unexpected continuation frame")
+                fragments.append(payload)
+            else:
+                raise RuntimeError(f"unexpected opcode 0x{opcode:x}")
+
+            if fin:
+                data = b"".join(fragments)
+                if compressed and deflate_on:
+                    data = decompress_message(data)
+                return msg_opcode, data
 
     # Send subscription
     writer.write(encode_frame(sub.encode()))
@@ -326,7 +379,7 @@ async def main():
     # Read and print messages
     try:
         while True:
-            opcode, payload = await read_frame()
+            opcode, payload = await read_message()
             recv_ns = time.time_ns()
             if opcode == 0x1:  # text
                 # The C++ relay may coalesce multiple messages into one
