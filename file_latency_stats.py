@@ -200,30 +200,27 @@ def main():
         except json.JSONDecodeError:
             return
 
-        events = d.get("events", [])
-        # Check if any event is for our coins
-        has_coin = any(e.get("coin") in coins for e in events)
-        if not has_coin and events:
-            return
-        print(d)
-        block_time = parse_iso_ns(d["block_time"])
-        local_time = parse_iso_ns(d["local_time"])
-
-        e2e = t_read - block_time
-        file_lat = local_time - block_time
-
-        if events:
+        if "block_number" in d:
+            # Batch format: {block_number, block_time, local_time, events:[...]}
+            events = d.get("events", [])
             coin_events = [e for e in events if e.get("coin") in coins]
-            if coin_events:
-                book_block_count += 1
-                btc_eth_book_events += len(coin_events)
-                book_latencies_e2e.append(e2e * 1000)  # ms
-                book_latencies_file.append(file_lat * 1000)
-        else:
-            # Empty block - still record latency for the block itself
+            if not coin_events and events:
+                return
+            block_time = parse_iso_ns(d["block_time"])
+            local_time = parse_iso_ns(d["local_time"])
+            e2e = t_read - block_time
+            file_lat = local_time - block_time
             book_block_count += 1
+            btc_eth_book_events += len(coin_events)
             book_latencies_e2e.append(e2e * 1000)
             book_latencies_file.append(file_lat * 1000)
+        else:
+            # Line format: single event {"coin":..., ...} — no timestamps
+            if d.get("coin") not in coins:
+                return
+            book_block_count += 1
+            btc_eth_book_events += 1
+            # No block_time available — skip latency recording
 
     def process_fills_line(line: str):
         nonlocal fills_block_count, btc_eth_fill_events
@@ -233,22 +230,35 @@ def main():
         except json.JSONDecodeError:
             return
 
-        events = d.get("events", [])
-        # events are [address, fill_obj] pairs
-        coin_fills = [e for e in events if len(e) >= 2 and e[1].get("coin") in coins]
-        if not coin_fills:
-            return
-
-        block_time = parse_iso_ns(d["block_time"])
-        local_time = parse_iso_ns(d["local_time"])
-
-        e2e = t_read - block_time
-        file_lat = local_time - block_time
-
-        fills_block_count += 1
-        btc_eth_fill_events += len(coin_fills)
-        fills_latencies_e2e.append(e2e * 1000)
-        fills_latencies_file.append(file_lat * 1000)
+        if isinstance(d, dict) and "block_number" in d:
+            # Batch format: {block_number, block_time, local_time, events:[...]}
+            events = d.get("events", [])
+            coin_fills = [e for e in events if len(e) >= 2 and e[1].get("coin") in coins]
+            if not coin_fills:
+                return
+            block_time = parse_iso_ns(d["block_time"])
+            local_time = parse_iso_ns(d["local_time"])
+            e2e = t_read - block_time
+            file_lat = local_time - block_time
+            fills_block_count += 1
+            btc_eth_fill_events += len(coin_fills)
+            fills_latencies_e2e.append(e2e * 1000)
+            fills_latencies_file.append(file_lat * 1000)
+        else:
+            # Line format: [addr, fill_obj] — use fill_obj["time"] (epoch ms) for e2e
+            if not isinstance(d, list) or len(d) < 2:
+                return
+            fill_obj = d[1]
+            if fill_obj.get("coin") not in coins:
+                return
+            event_time_ms = fill_obj.get("time")
+            if event_time_ms is None:
+                return
+            e2e = t_read - event_time_ms / 1000.0
+            fills_block_count += 1
+            btc_eth_fill_events += 1
+            fills_latencies_e2e.append(e2e * 1000)
+            # No local_time in line format — file_latency not available
 
     print("Listening for file changes via inotify...")
     print(f"  Book diffs: {get_current_hour_path(book_diffs_base)}")
@@ -342,19 +352,26 @@ def main():
         print("-" * 72)
 
         e2e_p = percentiles(e2e, pcts)
-        file_p = percentiles(file_lat, pcts)
+        has_file = bool(file_lat)
+        file_p = percentiles(file_lat, pcts) if has_file else {}
 
-        print(f"  {'Percentile':<12} {'End-to-End (ms)':>18} {'File Latency (ms)':>20} {'Read Overhead (ms)':>20}")
-        for p in pcts:
-            e = e2e_p[p]
-            f = file_p[p]
-            r = e - f
-            label = f"p{p:g}"
-            print(f"  {label:<12} {e:>18.1f} {f:>20.1f} {r:>20.1f}")
-
-        print(f"  {'max':<12} {max(e2e):>18.1f} {max(file_lat):>20.1f} {max(e2e)-max(file_lat):>20.1f}")
-        print(f"  {'min':<12} {min(e2e):>18.1f} {min(file_lat):>20.1f}")
-        print(f"  {'mean':<12} {sum(e2e)/len(e2e):>18.1f} {sum(file_lat)/len(file_lat):>20.1f}")
+        if has_file:
+            print(f"  {'Percentile':<12} {'End-to-End (ms)':>18} {'File Latency (ms)':>20} {'Read Overhead (ms)':>20}")
+            for p in pcts:
+                e, f = e2e_p[p], file_p[p]
+                label = f"p{p:g}"
+                print(f"  {label:<12} {e:>18.1f} {f:>20.1f} {e-f:>20.1f}")
+            print(f"  {'max':<12} {max(e2e):>18.1f} {max(file_lat):>20.1f} {max(e2e)-max(file_lat):>20.1f}")
+            print(f"  {'min':<12} {min(e2e):>18.1f} {min(file_lat):>20.1f}")
+            print(f"  {'mean':<12} {sum(e2e)/len(e2e):>18.1f} {sum(file_lat)/len(file_lat):>20.1f}")
+        else:
+            print(f"  {'Percentile':<12} {'End-to-End (ms)':>18}")
+            for p in pcts:
+                label = f"p{p:g}"
+                print(f"  {label:<12} {e2e_p[p]:>18.1f}")
+            print(f"  {'max':<12} {max(e2e):>18.1f}")
+            print(f"  {'min':<12} {min(e2e):>18.1f}")
+            print(f"  {'mean':<12} {sum(e2e)/len(e2e):>18.1f}")
 
     print_stats(
         f"Book Diffs (BTC/ETH events: {btc_eth_book_events})",
@@ -375,8 +392,12 @@ def main():
     print("\n" + "=" * 72)
     print("Key:")
     print("  End-to-End    = now() - block_time    (total latency you'd see)")
-    print("  File Latency  = local_time - block_time (node propagation + apply + write)")
-    print("  Read Overhead = End-to-End - File Latency (inotify + read + parse)")
+    if not args.line_format:
+        print("  File Latency  = local_time - block_time (node propagation + apply + write)")
+        print("  Read Overhead = End-to-End - File Latency (inotify + read + parse)")
+    else:
+        print("  Fills: block_time = fill event time field (epoch ms)")
+        print("  Book diffs: no timestamps in line format — event counts only")
 
 
 if __name__ == "__main__":
