@@ -276,7 +276,7 @@ static std::string filter_diffs_line(const std::string& raw,
 
     // // Line format: single event {"coin":"BTC",...} — no block wrapper
     if (raw.find("\"block_number\"") == std::string::npos) {
-        return coin_matches(data, 0, len, client->) ? raw : std::string{};
+        return coin_matches(data, 0, len, patterns) ? raw : std::string{};
     }
 
     // Batch-by-block format: find "events" array and splice matching events
