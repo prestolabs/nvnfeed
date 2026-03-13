@@ -866,9 +866,12 @@ public:
 
         // Enable permessage-deflate — large book diff messages compress ~80-90%,
         // reducing transmission time and net latency significantly.
+        // server_no_context_takeover: each message is compressed independently,
+        // so clients can use a fresh decompressor per frame.
         websocket::permessage_deflate pmd;
         pmd.server_enable = true;
         pmd.client_enable = true;
+        pmd.server_no_context_takeover = true;
         client_->ws.set_option(pmd);
 
         // Set auto-fragment off for lower latency
