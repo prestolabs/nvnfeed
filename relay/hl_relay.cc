@@ -264,8 +264,7 @@ build_coin_patterns(const std::unordered_set<std::string>& coins) {
 // Handles both batch-by-block (B) and line/single-event (L) formats.
 // Uses raw string splicing — no DOM parse, no re-serialize.
 static std::string filter_diffs_line(const std::string& raw,
-                                     const std::vector<std::pair<std::string, size_t>>& patterns,
-                                     const std::vector<std::string>& quoted_coins) {
+                                     const std::vector<std::pair<std::string, size_t>>& patterns) {
     const char* data = raw.data();
     const size_t len = raw.size();
 
@@ -324,8 +323,7 @@ static std::string filter_diffs_line(const std::string& raw,
 // check coin in the first element and keep both together.
 // Handles both batch-by-block (B) and line/single-event (L) formats.
 static std::string filter_fills_line(const std::string& raw,
-                                     const std::vector<std::pair<std::string, size_t>>& patterns,
-                                     const std::vector<std::string>& quoted_coins) {
+                                     const std::vector<std::pair<std::string, size_t>>& patterns) {
     const char* data = raw.data();
     const size_t len = raw.size();
 
@@ -564,10 +562,10 @@ public:
                 // Cache miss — compute filter
                 std::string filtered;
                 if (channel == 'D')
-                    filtered = filter_diffs_line(raw_line, client->coin_patterns, client->quoted_coins);
+                    filtered = filter_diffs_line(raw_line, client->coin_patterns);
                 else
                 
-                    filtered = filter_fills_line(raw_line, client->coin_patterns, client->quoted_coins);
+                    filtered = filter_fills_line(raw_line, client->coin_patterns);
 
                 if (filtered.empty()) {
                     // No match — cache nullptr so we skip for other
